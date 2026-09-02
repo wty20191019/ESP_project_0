@@ -16,11 +16,11 @@ void app_main(void)
     while (1)
     {
 
-        led_set_rgb(5, 0, 0);
+        led_set_rgb(1, 0, 0);
         vTaskDelay(pdMS_TO_TICKS(100));
-        led_set_rgb(0, 5, 0);
+        led_set_rgb(0, 1, 0);
         vTaskDelay(pdMS_TO_TICKS(100));
-        led_set_rgb(0, 0, 5);
+        led_set_rgb(0, 0, 1);
         vTaskDelay(pdMS_TO_TICKS(100));
         led_clear();
 
