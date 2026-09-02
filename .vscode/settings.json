@@ -31,7 +31,7 @@
   "clangd.arguments": [
     "--background-index",
     "--query-driver=**",
-    "--compile-commands-dir=d:\\Desktop\\sample_project_0\\build"
+    "--compile-commands-dir=d:\\Desktop\\ESP32_S3_N16R8_sample_project_0\\build"
   ],
   "idf.flashType": "JTAG"
 }
