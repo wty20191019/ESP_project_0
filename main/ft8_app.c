@@ -301,7 +301,7 @@ static void ft8_rx_task(void *arg)
             if (s_cfg.rx_enable) rx_decode_slot(&mon, prev_slot);
         }
 
-        /* 每秒状态 */
+        /* 每1000ms状态 */
         if (now_us - last_log_us >= 1000000) {
             last_log_us = now_us;
             const char *clock = (s_cfg.utc_enable && s_utc_ok) ? "UTC" : "本地";
@@ -421,6 +421,24 @@ static void ft8_tx_task(void *arg)
                 sent += wr;
             }
             pos += (size_t)n;
+        }
+
+        /* 冲刷：DMA 环内还有 ~0.12s 残余，空闲时可能被循环重放，
+         * 末尾补一整块全零，让残余与后续输出都固定为静音 */
+        memset(st, 0, sizeof(st));
+        {
+            size_t bytes = sizeof(st);
+            size_t sent = 0;
+            while (sent < bytes) {
+                size_t wr = 0;
+                esp_err_t err = wm8978_i2s_write((const uint8_t *)st + sent,
+                                                 bytes - sent, &wr, 2000);
+                if (err != ESP_OK || wr == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    continue;
+                }
+                sent += wr;
+            }
         }
     }
     s_tx_busy = false;

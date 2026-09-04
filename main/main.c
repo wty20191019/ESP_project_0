@@ -47,7 +47,7 @@ void app_main(void)
     cfg.msg_mode      = FT8_APP_MSG_CQ;      /* CQ 呼叫，或 FT8_APP_MSG_CALL 呼叫指定台 */
     cfg.cq_modifier[0] = '\0';               /* "DX"/"WW"/"TEST"... */
     cfg.audio_freq_hz = 1500.0f;             /* 音频中心(8-GFSK tone0) */
-    cfg.audio_level   = 0.5f;               /* 发射电平 */
+    cfg.audio_level   = 0.10f;               /* 发射电平 */
     cfg.rx_f_max      = 3000.0f;             /* 解码频率上限 */
 
     if (ft8_app_start(&cfg) != ESP_OK) {
