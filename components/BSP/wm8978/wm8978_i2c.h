@@ -4,13 +4,13 @@
 #include "driver/gpio.h"
 
 /* ===== WM8978 (I2C0) 引脚定义 ===== */
-#define WM_I2C_SCL          GPIO_NUM_8
-#define WM_I2C_SDA          GPIO_NUM_9
+#define WM_I2C_SCL          GPIO_NUM_3
+#define WM_I2C_SDA          GPIO_NUM_21
 
 /* I2C0 总线频率。
  * 注意：WM8978 模块板若未外接 I2C 上拉电阻，仅靠芯片内部弱上拉时，
  * 400kHz 偶发 NACK/通信失败，请降到 100kHz；有可靠外部上拉可改回 400kHz */
-#define WM8978_I2C_FREQ_HZ  (100 * 1000)
+#define WM8978_I2C_FREQ_HZ  (400 * 1000)
 
 /* 单次寄存器写失败后的重试次数（应对上电初期总线毛刺/从机未就绪） */
 #define WM8978_I2C_WRITE_RETRY  3
