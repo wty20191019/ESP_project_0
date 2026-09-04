@@ -11,8 +11,17 @@
 #   - 解码属于重浮点运算, 这里用 -O2 优化.
 
 idf_component_register(
-    SRC_DIRS "ft8" "fft"
-    SRCS "common/monitor.c"
+    SRCS
+        "ft8/constants.c"
+        "ft8/crc.c"
+        "ft8/decode.c"
+        "ft8/encode.c"
+        "ft8/ldpc.c"
+        "ft8/message.c"
+        "ft8/text.c"
+        "fft/kiss_fft.c"
+        "fft/kiss_fftr.c"
+        "common/monitor.c"
     INCLUDE_DIRS "." "ft8" "fft" "common"
 )
 
