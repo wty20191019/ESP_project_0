@@ -16,6 +16,7 @@
 #include "ft8_app.h"
 #include "led.h"
 #include "lcd.h"
+#include "key.h"
 
 #define TAG "main"
 
@@ -72,8 +73,22 @@ static void rgb_led_task(void *arg)
     }
 }
 
+static void my_key_callback(key_id_t key_id, key_event_t event, void *user_data)
+{
+    /* 只处理单击和长按事件，忽略按下/松开的瞬间 */
+    if (event == KEY_EVENT_CLICK) {
+        ESP_LOGI("APP", "按键 %d 单击", key_id);
+    }
+    else if (event == KEY_EVENT_LONG_PRESS) {
+        ESP_LOGI("APP", "按键 %d 长按 ", key_id);
+    }
+}
+
+
 void app_main(void)
 {
+    key_init(my_key_callback, NULL);
+    
     /* ====== FT8/FT4 配置示例 ====== */
     ft8_app_config_t cfg;
     ft8_app_config_default(&cfg);

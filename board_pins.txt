@@ -30,13 +30,13 @@ esp32 s3
 
 
 /* ===== Keys ===== */
-#define KEY1            GPIO_NUM_2
-#define KEY2            GPIO_NUM_7
-#define KEY3            GPIO_NUM_38
-#define KEY4            GPIO_NUM_39
-#define KEY5            GPIO_NUM_40
-#define KEY6            GPIO_NUM_41
-#define KEY7            GPIO_NUM_47
+#define KEY1            GPIO_NUM_2     //up
+#define KEY2            GPIO_NUM_7     //DWN
+#define KEY3            GPIO_NUM_38    //LET
+#define KEY4            GPIO_NUM_39    //RHT
+#define KEY5            GPIO_NUM_40    //MID
+#define KEY6            GPIO_NUM_41    //SET
+#define KEY7            GPIO_NUM_47    //RST
 
 /* ===== RGB (WS2812 / SK68xx, led_strip RMT) ===== */
 #define LED_GPIO_PIN    GPIO_NUM_48
