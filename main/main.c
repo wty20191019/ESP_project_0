@@ -36,19 +36,19 @@ void app_main(void)
     ft8_app_config_t cfg;
     ft8_app_config_default(&cfg);
 
-    cfg.protocol      = FTX_PROTOCOL_FT8;    /* FTX_PROTOCOL_FT4 切到 FT4(7.5s 槽) */
-    cfg.tx_enable     = true;                /* 允许发射 */
+    cfg.protocol      = FTX_PROTOCOL_FT8;    /* FTX_PROTOCOL_FT4 切到 FT4(7.5s 时隙) */
+    cfg.tx_enable     = true;                /* 参与发射(仅在选中奇偶时隙) */
     cfg.rx_enable     = true;                /* 持续解码 */
+    cfg.utc_enable    = true;                /* 时隙对齐 UTC(:00/:15/:30/:45)，需先 SNTP 校时 */
+    cfg.tx_slot_parity = 0;                  /* 0=偶时隙发 / 1=奇时隙发，自动与对端交替 */
+    cfg.tx_delay_ms   = 500;                 /* 本台时隙内再延时发射 */
     snprintf(cfg.callsign, sizeof(cfg.callsign), "BG7ABC");
     snprintf(cfg.grid,     sizeof(cfg.grid),     "JO70");
     cfg.msg_mode      = FT8_APP_MSG_CQ;      /* CQ 呼叫，或 FT8_APP_MSG_CALL 呼叫指定台 */
     cfg.cq_modifier[0] = '\0';               /* "DX"/"WW"/"TEST"... */
-    cfg.tx_delay_ms   = 500;                 /* 槽开始后延时发射 */
-    cfg.time_offset_ms = 0;                  /* 时间栅格偏移(ms)，接真实电台时对齐 UTC */
-    cfg.audio_freq_hz = 1200.0f;             /* 音频中心频率 */
-    cfg.audio_level   = 0.10f;               /* 发射音量 */
-    cfg.rx_f_min      = 0.0f;
-    cfg.rx_f_max      = 4000.0f;
+    cfg.audio_freq_hz = 1500.0f;             /* 音频中心(8-GFSK tone0) */
+    cfg.audio_level   = 0.80f;               /* 发射电平 */
+    cfg.rx_f_max      = 3000.0f;             /* 解码频率上限 */
 
     if (ft8_app_start(&cfg) != ESP_OK) {
         ESP_LOGE(TAG, "ft8_app 启动失败");
