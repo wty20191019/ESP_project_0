@@ -20,7 +20,7 @@
 
 /* ====== 回声/采集参数 ====== */
 #define SAMPLE_RATE     16000           /* 采样率(Hz) */
-#define ECHO_DELAY_MS   200             /* 回声延迟，200ms 听感清晰 */
+#define ECHO_DELAY_MS   2               /* 回声延迟，200ms 听感清晰 */
 #define ECHO_FEEDBACK   0.55f           /* 回声反馈系数(0~1)，越大回音越长 */
 #define INPUT_GAIN      0.85f           /* 输入信号幅度(避免反馈叠加削波) */
 
