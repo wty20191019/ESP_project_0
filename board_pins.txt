@@ -1,0 +1,137 @@
+#pragma once
+#include "driver/gpio.h"
+
+/* ===== WM8978 (I2S0 + I2C0) ===== */
+#define WM_I2C_SCL      GPIO_NUM_3       //新
+#define WM_I2C_SDA      GPIO_NUM_21     //新
+#define WM_I2S_MCLK     GPIO_NUM_12
+#define WM_I2S_BCLK     GPIO_NUM_13
+#define WM_I2S_LRCK     GPIO_NUM_14
+#define WM_I2S_DOUT     GPIO_NUM_15   // MCU -> CODEC (DACDAT)
+#define WM_I2S_DIN      GPIO_NUM_16   // CODEC -> MCU (ADCDAT)
+
+/* ===== GNSS (UART1) ===== */
+#define GNSS_TXD        GPIO_NUM_17   // S3 TX -> GNSS RX
+#define GNSS_RXD        GPIO_NUM_18   // S3 RX <- GNSS TX
+
+/* ===== SPI LCD (SPI2_st7735) ===== */
+#define LCD_SCK         GPIO_NUM_10       //SCL​
+#define LCD_MOSI        GPIO_NUM_11      //SDA
+#define LCD_CS          GPIO_NUM_42          //片选，低电平有效。拉低时屏才听 SPI 总线的话；单屏可固定接地
+#define LCD_DC          GPIO_NUM_4        //Data/Command 选择：低电平=发命令，高电平=发数据。必须独立 GPIO 控制，
+#define LCD_RST         GPIO_NUM_5       //RES​ — 复位，低电平有效（RES/RET/RST）。给低脉冲屏复位，平时拉高
+#define LCD_BLK         GPIO_NUM_6      //背光控制。高电平点亮（模块内部已串限流电阻），低电平关背光灯。想常亮就接 VCC（3.3V/5V 看模块），想调亮度就接 PWM 脚
+
+st7735 tft 128x160 1.8寸
+st7735_tft_128x160_1.8LCD
+esp32 s3
+
+
+
+
+/* ===== Keys ===== */
+#define KEY1            GPIO_NUM_2
+#define KEY2            GPIO_NUM_7
+#define KEY3            GPIO_NUM_38
+#define KEY4            GPIO_NUM_39
+#define KEY5            GPIO_NUM_40
+#define KEY6            GPIO_NUM_41
+#define KEY7            GPIO_NUM_47
+
+/* ===== RGB (WS2812 / SK68xx, led_strip RMT) ===== */
+#define LED_GPIO_PIN    GPIO_NUM_48
+
+
+GPIO19/20：原生 USB D-/D+
+
+GPIO0/3/45/46：Strapping 脚，复位瞬间决定启动模式/电压，平时能当 IO，但按键/输出别在复位期拉死
+
+GPIO43/44：UART0 默认 TX/RX（接 CH340 那路），不用串口打印时可复用
+
+GPIO48：你接 WS2812 没问题，但若买的是 N16R8V（1.8V VDD_SPI 版本），GPIO47/48 电平也是 1.8V，不能直接驱 3.3V 逻辑。普通 N16R8（非 V）就是 3.3V
+
+
+
+
+
+
+
+
+
+
+
+这是 Karlis Goba 的 ft8_lib（WSJT-X FT8/FT4 解码用 C 实现）。看了一下它的接口，给你一条不用我代写代码也能照着推进的路线：
+
+一、现状
+WM8978 收发通路已跑通（48k）。ft8_lib 的解码入口在 ft8/decode.h（ftx_find_candidates + ftx_decode_candidate），它吃的不是 PCM，而是 6.25Hz/符号分辨率的 waterfall 幅度谱；水声谱由 common/monitor.c 生成，输入是 12000Hz 采样率、200~3000Hz 频段 的信号（demo 见 demo/decode_ft8.c）。
+
+二、移植 ft8_lib 为 ESP-IDF 组件
+建 components/ft8_lib，拷入：ft8/、fft/、common/monitor.{c,h}、ft8/decode/encode/message/ldpc/crc/constants/text、ft4_ft8_public/ 下的 .dat 数据文件（生成表）。
+用 idf_component_register(SRCS ...) 编译，配置好 include 路径；common/audio.c、wave.c 是 PC 用的，可裁剪。
+提供 decode.c demo 里那个 ftx_callsign_hash_interface_t（call→hash 查表）实现——嵌入式可先用固定小表或留空（只影响解码出“压缩呼号”消息的可读性，不影响 CRC/LDPC 解码成功）。
+三、DSP 前端（把 48k RX 变成 waterfall）
+I2S RX 取单声道（或左声道）48k PCM。
+重采样/抽取到 12000Hz（自己写整数倍抽取+低通，或用现成重采样）。
+每 0.16s 一个符号，按 monitor_config_t{f_min=200,f_max=3000,sample_rate=12000} 累积出 ftx_waterfall_t。
+现有 main 的“回声”只是验证链路；接下来 RX 数据应进 monitor 而非回放。
+四、实时调度与时基
+结构：RX task → 环形缓冲 → monitor task(每符号累积) → 攒满一个 FT8 槽(≈15s,FT8_SLOT_TIME) → decode task。
+FT8 按 15s 周期（偶数分钟 0/15/30/45s）发射，接收要槽位时间同步（RTC/NTP 或自同步滚动窗口）。
+性能注意：一次解码默认 140 候选 × LDPC 25 次迭代，在 S3(240MHz) 上较重，先实测耗时；超了就降 kMax_candidates / kLDPC_iterations、优化 -O2、解码放高优先级。
+五、发射
+用 ft8/encode.h（ftx_message_encode 等）+ demo gen_ft8.c 的思路：调制成 16bit 音频写入 I2S TX → DAC → 电台。
+需自己控制 PTT（与 15s 槽对齐发 12.64s，发完关）。
+用 ftx_message_decode 反查/自收验证。
+六、验证顺序（强烈建议）
+先把 test/wav/websdr_test*.wav 经移植的组件在 PC 或串口喂 12k 数据 跑通解码（库自带测试）。
+再从 WM8978 ADC 取 48k → 软件抽到 12k → 喂解码器，用电台或信号发生器送真实 FT8 信号验证。
+最后联 PTT/槽位做完整收发。
+我可以按这个顺序一步步帮你做（比如先把 ft8_lib 编译成 ESP-IDF 组件并在串口 dump 一段 12k PCM 到 PC 用官方 demo 对照验证）。你要从第几步开始？
+
+
+
+
+
+
+
+
+
+模拟音频（麦克风）
+   │
+   ▼
+[1] ADC + I2S 采集          → int16_t pcm[]（16位PCM，采样率12000 Hz）
+   │
+   ▼
+[2] 数字下变频（DDC）       → 复基带信号（I/Q，降低采样率至约3000 Hz）
+   │
+   ▼
+[3] 同步检测（Costas 序列） → 找到信号起始位置、频率偏移、符号定时
+   │
+   ▼
+[4] 解调（8-FSK 软判决）    → 每个符号的3比特对数似然比（LLR）或硬判决
+   │
+   ▼
+[5] 符号重组 & 移除 Costas  → 58个数据符号的LLR（174个软比特）
+   │
+   ▼
+[6] LDPC 译码               → 91位（硬判决或软判决，BP算法）
+   │
+   ▼
+[7] CRC 校验                → 检查14位CRC是否匹配
+   │
+   ▼
+[8] ftx_message_decode()    → 人类可读文本消息
+   │
+   ▼
+显示在屏幕上
+
+
+
+
+文本 → ftx_message_encode → payload[10]
+     → ftx_add_crc (在 crc.c 中) → a91[12]
+     → encode174 → codeword[22]
+     → ft8/ft4_encode → tones[]
+     → synth_gfsk → 音频
+
+

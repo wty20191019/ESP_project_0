@@ -15,21 +15,63 @@
 #include "esp_log.h"
 #include "ft8_app.h"
 #include "led.h"
+#include "lcd.h"
 
 #define TAG "main"
+
+static void LCD_task(void *arg)
+{
+    
+    static uint8_t res = 0;
+    if (res == 0)
+    {
+        LCD_Init();
+        ESP_LOGI(TAG, "LCD任务启动");
+        res = 1;
+    }
+
+    for (;;) 
+    {
+        LCD_Clear(BLACK);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        LCD_Clear(WHITE);LCD_ShowString(0, 0, (const uint8_t *)"FT8/FT4 App", WHITE, BLACK, 12, 0);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        LCD_Clear(RED);LCD_ShowString(0, 0, (const uint8_t *)"FT8/FT4 App", WHITE, BLACK, 16, 0);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        LCD_Clear(GREEN);LCD_ShowString(0, 0, (const uint8_t *)"FT8/FT4 App", WHITE, BLACK, 24, 0);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        LCD_Clear(BLUE);LCD_ShowString(0, 0, (const uint8_t *)"FT8/FT4 App", WHITE, BLACK, 32, 0);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+
 
 /* RGB LED 呼吸(可选)；不要可整段删除 */
 static void rgb_led_task(void *arg)
 {
-    led_init();
-    for (;;) {
-        for (uint8_t i = 0; i <= 200; i += 5) { led_set_rgb(i, 0, 0); vTaskDelay(pdMS_TO_TICKS(10)); }
-        for (uint8_t i = 200; i > 0; i -= 5)  { led_set_rgb(i, 0, 0); vTaskDelay(pdMS_TO_TICKS(10)); }
-        for (uint8_t i = 0; i <= 200; i += 5) { led_set_rgb(0, 0, i); vTaskDelay(pdMS_TO_TICKS(10)); }
-        for (uint8_t i = 200; i > 0; i -= 5)  { led_set_rgb(0, 0, i); vTaskDelay(pdMS_TO_TICKS(10)); }
+    static uint8_t res = 0;
+    if (res == 0)
+    {
+        led_init();
+        ESP_LOGI(TAG, "RGB LED 呼吸任务启动");
+        res = 1;
+    }
+    
+
+    for (;;) 
+    {
+        for (int i = 0; i <= 255; i += 5) { led_set_rgb(i, 0, 0); vTaskDelay(pdMS_TO_TICKS(10)); }
+        for (int i = 255; i > 0; i -= 5)  { led_set_rgb(i, 0, 0); vTaskDelay(pdMS_TO_TICKS(10)); }
+
+        for (int i = 0; i <= 255; i += 5) { led_set_rgb(0, i, 0); vTaskDelay(pdMS_TO_TICKS(10)); }
+        for (int i = 255; i > 0; i -= 5)  { led_set_rgb(0, i, 0); vTaskDelay(pdMS_TO_TICKS(10)); }
+
+        for (int i = 0; i <= 255; i += 5) { led_set_rgb(0, 0, i); vTaskDelay(pdMS_TO_TICKS(10)); }
+        for (int i = 255; i > 0; i -= 5)  { led_set_rgb(0, 0, i); vTaskDelay(pdMS_TO_TICKS(10)); }
     }
 }
-//st7735 tft 128 160 1.8
+
 void app_main(void)
 {
     /* ====== FT8/FT4 配置示例 ====== */
@@ -55,5 +97,6 @@ void app_main(void)
         return;
     }
 
+    xTaskCreatePinnedToCore(LCD_task, "LCD", 2048, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(rgb_led_task, "rgb_led", 2048, NULL, 1, NULL, 0);
 }
