@@ -1,12 +1,11 @@
-/* WM8978 回声(Echo)测试：
- * 数字回环链路：模拟输入(R2/L2 线路输入 或 RIP/LIP 咪头输入)
- *   -> WM8978 ADC -> I2S0 RX 读回 -> 软件回声效果(延迟+反馈)
- *   -> I2S0 TX 送出 -> WM8978 DAC -> 耳机/喇叭。
- * 对着输入说话/放音，应能听到原声以及一次次的衰减回音。
+/* 多任务演示：回声测试 + RGB LED
+ *  - wm8978_echo_task：WM8978 数字回声（ADC 采集 -> 回声效果 -> DAC 回放）
+ *  - rgb_led_task：LED(WS2812) 三色呼吸循环
  *
  * 接线约定（见 wm8978_i2c.h / wm8978_i2s.h）：
  *   I2C0: SCL=GPIO8, SDA=GPIO9
  *   I2S0: MCLK=GPIO12, BCLK=GPIO13, LRCK=GPIO14, DOUT=GPIO15, DIN=GPIO16
+ *   LED : GPIO48 (见 led.h)
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -15,8 +14,9 @@
 #include "esp_log.h"
 #include "wm8978.h"
 #include "wm8978_i2s.h"
+#include "led.h"
 
-#define TAG "echo"
+#define TAG "main"
 
 /* ====== 回声/采集参数 ====== */
 #define SAMPLE_RATE     16000           /* 采样率(Hz) */
@@ -68,17 +68,19 @@ static void echo_process(int16_t *buf, int nframes)
     }
 }
 
-void app_main(void)
+/* ================= 任务1：WM8978 回声测试 ================= */
+static void wm8978_echo_task(void *arg)
 {
-    ESP_LOGI(TAG, "WM8978 回声测试开始(SR=%dHz, 延迟=%dms, 输入源=%d)",
+    const char *T = "echo";
+    ESP_LOGI(T, "回声任务启动(SR=%dHz, 延迟=%dms, 输入源=%d)",
              SAMPLE_RATE, ECHO_DELAY_MS, ECHO_INPUT_SRC);
 
     /* 上电稳定窗口，避免启动瞬间 I2C 偶发失败 */
     vTaskDelay(pdMS_TO_TICKS(200));
 
     if (WM8978_Init() != 0) {
-        ESP_LOGE(TAG, "WM8978 初始化失败，请检查 I2C 接线/供电");
-        return;
+        ESP_LOGE(T, "WM8978 初始化失败，请检查 I2C 接线/供电");
+        goto fail;
     }
 
     /* 打开 ADC(采集输入)与 DAC(回声输出) */
@@ -87,15 +89,15 @@ void app_main(void)
     /* 按输入源配置输入通路：MIC 对应 RIP/LIP(PGA)，LineIn 对应 R2/L2 */
     if (ECHO_INPUT_SRC == 1) {
         WM8978_Input_Cfg(1, 0, 0);              /* 仅咪头 RIP/LIP */
-        WM8978_MIC_Gain(40);                    /* MIC PGA 增益(参考录音机实验风格) */
-        ESP_LOGI(TAG, "输入源: MIC (RIP/LIP)");
+        WM8978_MIC_Gain(40);                    /* MIC PGA 增益 */
+        ESP_LOGI(T, "输入源: MIC (RIP/LIP)");
     } else if (ECHO_INPUT_SRC == 0) {
         WM8978_Input_Cfg(0, 1, 0);              /* 仅线路输入 R2/L2 */
-        ESP_LOGI(TAG, "输入源: LINE IN (R2/L2)");
+        ESP_LOGI(T, "输入源: LINE IN (R2/L2)");
     } else {
         WM8978_Input_Cfg(1, 1, 0);              /* 两路同时使能 */
         WM8978_MIC_Gain(40);
-        ESP_LOGI(TAG, "输入源: MIC + LINE IN 同时");
+        ESP_LOGI(T, "输入源: MIC + LINE IN 同时");
     }
 
     WM8978_Output_Cfg(1, 0);        /* DAC 输出使能，关闭模拟 Bypass */
@@ -103,27 +105,27 @@ void app_main(void)
     WM8978_HPvol_Set(50, 50);       /* 耳机音量 */
     WM8978_SPKvol_Set(40);          /* 喇叭音量 */
 
-    /* 初始化 I2S0 全双工并同时启动 TX/RX，为 WM8978 提供 MCLK 并采集/回放 */
+    /* 初始化 I2S0 全双工并同时启动 TX/RX */
     esp_err_t err = wm8978_i2s_init(SAMPLE_RATE);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "I2S 初始化失败: %s", esp_err_to_name(err));
-        return;
+        ESP_LOGE(T, "I2S 初始化失败: %s", esp_err_to_name(err));
+        goto fail;
     }
     err = wm8978_i2s_start_rx();
     err |= wm8978_i2s_start_tx();
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "I2S 启动失败: %s", esp_err_to_name(err));
-        return;
+        ESP_LOGE(T, "I2S 启动失败: %s", esp_err_to_name(err));
+        goto fail;
     }
 
-    ESP_LOGI(TAG, "数字回声已开启，请对输入源发声...");
+    ESP_LOGI(T, "数字回声已开启，请对输入源发声...");
 
     /* 实时回环：读 ADC -> 回声处理 -> 写 DAC */
     for (;;) {
         size_t got = 0;
         err = wm8978_i2s_read(s_audio_buf, sizeof(s_audio_buf), &got, 1000);
         if (err != ESP_OK || got == 0) {
-            ESP_LOGW(TAG, "I2S 读失败: %s", esp_err_to_name(err));
+            ESP_LOGW(T, "I2S 读失败: %s", esp_err_to_name(err));
             continue;
         }
         echo_process(s_audio_buf, (int)(got / 4));   /* got/4 = 帧数 */
@@ -131,7 +133,38 @@ void app_main(void)
         size_t sent = 0;
         err = wm8978_i2s_write(s_audio_buf, got, &sent, 1000);
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "I2S 写失败: %s", esp_err_to_name(err));
+            ESP_LOGW(T, "I2S 写失败: %s", esp_err_to_name(err));
         }
     }
+
+fail:
+    ESP_LOGE(T, "回声任务异常退出");
+    vTaskDelete(NULL);
+}
+
+/* ================= 任务2：RGB LED 呼吸 ================= */
+static void rgb_led_task(void *arg)
+{
+    const char *T = "rgb_led";
+    led_init();
+    ESP_LOGI(T, "RGB LED 任务启动");
+
+    for (;;) {
+        for (uint8_t i = 0; i <= 250; i += 5) { led_set_rgb(i, 0, 0); vTaskDelay(pdMS_TO_TICKS(6)); }
+        for (uint8_t i = 250; i > 0; i -= 5)  { led_set_rgb(i, 0, 0); vTaskDelay(pdMS_TO_TICKS(6)); }
+
+        for (uint8_t i = 0; i <= 250; i += 5) { led_set_rgb(0, i, 0); vTaskDelay(pdMS_TO_TICKS(6)); }
+        for (uint8_t i = 250; i > 0; i -= 5)  { led_set_rgb(0, i, 0); vTaskDelay(pdMS_TO_TICKS(6)); }
+
+        for (uint8_t i = 0; i <= 250; i += 5) { led_set_rgb(0, 0, i); vTaskDelay(pdMS_TO_TICKS(6)); }
+        for (uint8_t i = 250; i > 0; i -= 5)  { led_set_rgb(0, 0, i); vTaskDelay(pdMS_TO_TICKS(6)); }
+    }
+}
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "创建任务: wm8978_echo_task / rgb_led_task");
+
+    xTaskCreatePinnedToCore(wm8978_echo_task, "wm8978_echo", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(rgb_led_task, "rgb_led", 2048, NULL, 5, NULL, 0);
 }
