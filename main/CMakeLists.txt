@@ -1,5 +1,5 @@
 idf_component_register(
-    SRCS "main.c"
+    SRCS "main.c" "ft8_app.c"
     INCLUDE_DIRS "."
-    REQUIRES BSP
+    REQUIRES BSP ft8_lib esp_timer
 )
