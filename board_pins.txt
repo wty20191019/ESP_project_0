@@ -1,18 +1,20 @@
 #pragma once
 #include "driver/gpio.h"
 
+esp32 s3n16r8
 /* ===== WM8978 (I2S0 + I2C0) ===== */
 #define WM_I2C_SCL      GPIO_NUM_3       //新
 #define WM_I2C_SDA      GPIO_NUM_21     //新
-#define WM_I2S_MCLK     GPIO_NUM_12
-#define WM_I2S_BCLK     GPIO_NUM_13
-#define WM_I2S_LRCK     GPIO_NUM_14
-#define WM_I2S_DOUT     GPIO_NUM_15   // MCU -> CODEC (DACDAT)
-#define WM_I2S_DIN      GPIO_NUM_16   // CODEC -> MCU (ADCDAT)
+#define WM_I2S_MCLK     GPIO_NUM_12  //MCK
+#define WM_I2S_BCLK     GPIO_NUM_13  //SCK
+#define WM_I2S_LRCK     GPIO_NUM_14  //FSA
+#define WM_I2S_DOUT     GPIO_NUM_15   // MCU -> CODEC (DACDAT)  //DAT
+#define WM_I2S_DIN      GPIO_NUM_16   // CODEC -> MCU (ADCDAT) //SDB
 
 /* ===== GNSS (UART1) ===== */
 #define GNSS_TXD        GPIO_NUM_17   // S3 TX -> GNSS RX
 #define GNSS_RXD        GPIO_NUM_18   // S3 RX <- GNSS TX
+#define PPS_GPIO           GPIO_NUM_9
 
 /* ===== SPI LCD (SPI2_st7735) ===== */
 #define LCD_SCK         GPIO_NUM_10       //SCL​
@@ -51,6 +53,12 @@ GPIO43/44：UART0 默认 TX/RX（接 CH340 那路），不用串口打印时可�
 GPIO48：你接 WS2812 没问题，但若买的是 N16R8V（1.8V VDD_SPI 版本），GPIO47/48 电平也是 1.8V，不能直接驱 3.3V 逻辑。普通 N16R8（非 V）就是 3.3V
 
 
+GPIO30、GPIO31（SPIWP / SPIHD，Flash 与 PSRAM 共用）
+GPIO32（SPICS0，Flash 片选）
+GPIO33（SPICLK，Flash 与 PSRAM 共用时钟）
+GPIO34、GPIO35（Quad Flash 的 DO/DI，同时被 Octal PSRAM 复用为 DQ1/DQ0）
+GPIO36（Octal PSRAM DQ7）
+GPIO37（Octal PSRAM DQS/DM）
 
 
 
