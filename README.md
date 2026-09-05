@@ -14,6 +14,8 @@
 - **精确时序**：严格对齐 UTC 时隙边界，支持奇偶时隙交替
 - **GFSK 调制**：高斯成形 8-GFSK 波形，占用带宽约 50Hz
 - **硬件加速**：PSRAM 波形预生成，优化的 FFT 解码
+- **LCD 显示**：1.8 寸 ST7735 TFT 彩屏（128×160），SPI+DMA 高速刷新
+- **按键输入**：7 键 GPIO 扫描，支持单击和长按检测
 
 ## 硬件要求
 
@@ -25,6 +27,8 @@
 
 ### GPIO 接线定义
 
+**音频接口（WM8978）**
+
 | 功能 | GPIO | 说明 |
 |------|------|------|
 | I2C SCL | GPIO3 | WM8978 I2C 时钟线 |
@@ -34,6 +38,34 @@
 | I2S LRCK | GPIO14 | I2S 声道时钟 |
 | I2S DOUT | GPIO15 | I2S 数据输出（MCU→CODEC） |
 | I2S DIN | GPIO16 | I2S 数据输入（CODEC→MCU） |
+
+**LCD 显示屏（ST7735）**
+
+| 功能 | GPIO | 说明 |
+|------|------|------|
+| SPI SCK | GPIO10 | SPI 时钟线 |
+| SPI MOSI | GPIO11 | SPI 数据线 |
+| LCD CS | GPIO42 | 片选（低有效） |
+| LCD DC | GPIO4 | 数据/命令选择 |
+| LCD RST | GPIO5 | 复位（低有效） |
+| LCD BLK | GPIO6 | 背光（高电平点亮） |
+
+**按键输入**
+
+| 功能 | GPIO | 说明 |
+|------|------|------|
+| KEY_UP | GPIO2 | 上 |
+| KEY_DOWN | GPIO7 | 下 |
+| KEY_LEFT | GPIO38 | 左 |
+| KEY_RIGHT | GPIO39 | 右 |
+| KEY_MID | GPIO40 | 中间确认 |
+| KEY_SET | GPIO41 | 设置 |
+| KEY_RST | GPIO47 | 复位 |
+
+**状态指示**
+
+| 功能 | GPIO | 说明 |
+|------|------|------|
 | RGB LED | GPIO48 | WS2812 状态指示灯 |
 
 ### 音频规格
@@ -50,7 +82,7 @@ ESP_project_0/
 ├── partitions-16MiB.csv           # 16MiB Flash 分区表
 ├── dependencies.lock              # 组件依赖锁定文件
 ├── main/                          # 应用主模块
-│   ├── main.c                     # 入口：app_main()，配置并启动 ft8_app
+│   ├── main.c                     # 入口：app_main()，配置并启动 ft8_app、LCD、按键、LED
 │   ├── ft8_app.c                  # 核心应用控制器：RX/TX 双任务调度
 │   ├── ft8_app.h                  # ft8_app 接口定义
 │   ├── CMakeLists.txt             # main 组件构建文件
@@ -61,8 +93,14 @@ ESP_project_0/
 │   │   │   ├── wm8978.c/.h        # 寄存器逻辑层（软件缓存表）
 │   │   │   ├── wm8978_i2c.c/.h    # I2C 总线驱动
 │   │   │   └── wm8978_i2s.c/.h    # I2S 全双工驱动
-│   │   └── led/                   # RGB LED 驱动
-│   │       └── led.c/.h           # WS2812 LED 控制
+│   │   ├── led/                   # RGB LED 驱动
+│   │   │   └── led.c/.h           # WS2812 LED 控制
+│   │   └── key/                   # 按键驱动
+│   │       └── key.c/.h           # 7 键 GPIO 扫描（防抖+长按）
+│   ├── LCD_1.8_st7735/            # LCD 显示驱动
+│   │   ├── lcd_init.c/.h          # 底层 SPI+DMA 驱动
+│   │   ├── lcd.c/.h               # 上层绘图/字符 API
+│   │   └── lcdfont.h              # 字体数据（12/16/24/32 点阵）
 │   └── ft8_lib/                   # FT8/FT4 协议库
 │       ├── ft8/                   # 协议核心
 │       │   ├── encode.c/.h        # 编码：消息→payload→tone 序列
@@ -119,6 +157,42 @@ ESP_project_0/
 1. **I2C 层** (`wm8978_i2c.c`)：I2C0 总线驱动，400kHz，支持写重试
 2. **逻辑层** (`wm8978.c`)：维护 58 个寄存器的软件缓存表，配置 ADC/DAC/EQ/音量
 3. **I2S 层** (`wm8978_i2s.c`)：I2S0 全双工驱动，DMA 双缓冲
+
+### 4. LCD 显示驱动 (`components/LCD_1.8_st7735/`)
+
+1.8 寸 ST7735 TFT 彩屏驱动（128×160 像素，RGB565 格式）：
+
+**底层驱动** (`lcd_init.c`)
+- SPI2 硬件主模式，40MHz 时钟
+- DMA 分块传输，避免大缓冲区溢出
+- GPIO 控制：CS/DC/RST/BLK
+
+**上层绘图 API** (`lcd.c`)
+- 基础图形：`LCD_Clear`、`LCD_Fill`、`LCD_DrawPoint`、`LCD_DrawLine`、`LCD_DrawRectangle`、`Draw_Circle`
+- 字符显示：`LCD_ShowChar`、`LCD_ShowString`（支持 12/16/24/32 点阵字体）
+- 数字显示：`LCD_ShowIntNum`、`LCD_ShowFloatNum1`
+- 图片显示：`LCD_ShowPicture`（RGB565 数组）
+
+**显示方向**
+- `USE_HORIZONTAL`：0/1 竖屏(128×160)，2/3 横屏(160×128)
+
+### 5. 按键驱动 (`components/BSP/key/`)
+
+7 键 GPIO 扫描驱动，支持防抖和长按检测：
+
+**按键定义**
+- `KEY_UP` (GPIO2)、`KEY_DOWN` (GPIO7)、`KEY_LEFT` (GPIO38)、`KEY_RIGHT` (GPIO39)
+- `KEY_MID` (GPIO40)、`KEY_SET` (GPIO41)、`KEY_RST` (GPIO47)
+
+**事件类型**
+- `KEY_EVENT_PRESSED`：按下瞬间
+- `KEY_EVENT_RELEASED`：松开瞬间
+- `KEY_EVENT_CLICK`：单击（按下后快速松开）
+- `KEY_EVENT_LONG_PRESS`：长按（按住超过阈值时间）
+
+**回调机制**
+- 注册回调函数：`key_init(callback, user_data)`
+- 回调参数：`key_id_t key_id, key_event_t event, void *user_data`
 
 ## 数据流
 
@@ -271,6 +345,10 @@ idf.py monitor
 
 6. **编译优化**：ft8_lib 使用 `-O2` 优化（解码是重浮点运算），BSP 使用 `-O3 -ffast-math`。
 
+7. **LCD 任务栈大小**：LCD 任务栈建议设置为 3072~4096 字节（`LCD_Fill` 内部有 320 字节栈上数组）。
+
+8. **SPI 时钟**：LCD SPI 默认 40MHz，ST7735 标称 ~15MHz，实测可跑更高。如遇显示异常可降低时钟（修改 `lcd_init.h` 中的 `LCD_SPI_CLK_HZ`）。
+
 ## 开发指南
 
 ### 修改硬件引脚
@@ -279,6 +357,8 @@ idf.py monitor
 - I2C 引脚：`components/BSP/wm8978/wm8978_i2c.h:8`
 - I2S 引脚：`components/BSP/wm8978/wm8978_i2s.h:10-14`
 - LED 引脚：`components/BSP/led/led.h:5`
+- LCD 引脚：`components/LCD_1.8_st7735/lcd_init.h:36-53`
+- 按键引脚：`components/BSP/key/key.h:11-17`
 
 ### 调整发射参数
 
@@ -288,7 +368,8 @@ idf.py monitor
 
 1. **添加新的解码后处理**：在 `ft8_rx_task` 的 `rx_decode_slot()` 函数中添加逻辑
 2. **添加新的消息模式**：扩展 `ft8_app_msg_mode_t` 枚举和 `tx_encode_message()` 函数
-3. **添加 UI 显示**：在 `main.c` 中添加显示任务，读取 `s_stat_decoded` 等统计变量
+3. **添加 UI 显示**：使用 LCD API（`LCD_ShowString`、`LCD_ShowIntNum` 等）显示解码结果
+4. **添加按键处理**：在 `key_init` 回调中处理按键事件，实现菜单导航或参数调整
 
 ## 故障排除
 
@@ -303,6 +384,8 @@ idf.py monitor
 - **WM8978 初始化失败**：检查 I2C 接线和上拉电阻
 - **无解码输出**：检查天线连接、音频电平、频率配置
 - **发射无信号**：检查 I2S 接线、发射电平、时隙配置
+- **LCD 无显示**：检查 SPI 接线、背光引脚、CS/DC/RST 控制信号
+- **按键无响应**：检查 GPIO 接线、上拉电阻、回调函数注册
 
 ### 性能优化
 
@@ -316,6 +399,7 @@ idf.py monitor
 - [ft8_lib 开源库](https://github.com/kgoba/ft8_lib)
 - [ESP-IDF 编程指南](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32s3/)
 - [WM8978 数据手册](https://www.wolfsonmicro.com/products/WM8978)
+- [ST7735 数据手册](https://www.st.com/resource/en/datasheet/st7735.pdf)
 
 ## 许可证
 
