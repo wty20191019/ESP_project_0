@@ -401,9 +401,6 @@ idf.py monitor
 - [WM8978 数据手册](https://www.wolfsonmicro.com/products/WM8978)
 - [ST7735 数据手册](https://www.st.com/resource/en/datasheet/st7735.pdf)
 
-## 许可证
-
-本项目基于 MIT 许可证开源。详见 LICENSE 文件。
 
 ## 贡献
 
