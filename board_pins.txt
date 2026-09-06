@@ -1,7 +1,7 @@
 #pragma once
 #include "driver/gpio.h"
 
-esp32 s3n16r8
+esp32 s3n16r8  idf 6.1.0
 /* ===== WM8978 (I2S0 + I2C0) ===== */
 #define WM_I2C_SCL      GPIO_NUM_3       //新
 #define WM_I2C_SDA      GPIO_NUM_21     //新
