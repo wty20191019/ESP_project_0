@@ -7,12 +7,14 @@
 /* ============================================================
  * ST7735 1.8 寸 TFT(128x160) 上层绘图/字符 API
  * 参考: STM32F103 例程 HARDWARE/LCD/lcd.h
- * 说明: 图形与文字函数均基于 “设置窗口 + DMA 推像素” 实现。
+ * 说明: 绘图函数先写离屏整帧缓冲, 再经 LCD_Flush() 一次性 DMA 上屏,
+ *       避免逐行直推造成的"扫描/闪烁"。
  * ============================================================ */
 
 /* ------------------------- 基础图形 ------------------------- */
 void LCD_Fill(uint16_t xsta, uint16_t ysta, uint16_t xend, uint16_t yend, uint16_t color); /* 区域填充(不含右/下边界) */
-void LCD_Clear(uint16_t color);                                                            /* 整屏清屏 */
+void LCD_Clear(uint16_t color);                                                            /* 清屏(写缓冲) */
+void LCD_Flush(void);                                                                      /* 整帧一次推送显示 */
 void LCD_DrawPoint(uint16_t x, uint16_t y, uint16_t color);                                 /* 画点 */
 void LCD_DrawLine(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint16_t color);      /* 画线 */
 void LCD_DrawRectangle(uint16_t x1, uint16_t y1, uint16_t x2, uint16_t y2, uint16_t color); /* 空心矩形 */
