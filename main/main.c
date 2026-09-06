@@ -269,7 +269,9 @@ static void LCD_task(void *arg)
         else if (page == 1) draw_page_sat(&g);
         else                draw_page_signal(g);
 
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        LCD_Flush();                       /* 画完一整帧后一次性推送 */
+
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
