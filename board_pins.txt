@@ -14,7 +14,7 @@ esp32 s3n16r8
 /* ===== GNSS (UART1) ===== */
 #define GNSS_TXD        GPIO_NUM_17   // S3 TX -> GNSS RX
 #define GNSS_RXD        GPIO_NUM_18   // S3 RX <- GNSS TX
-#define PPS_GPIO           GPIO_NUM_9
+#define PPS_GPIO           GPIO_NUM_9   //检测上升沿
 
 /* ===== SPI LCD (SPI2_st7735) ===== */
 #define LCD_SCK         GPIO_NUM_10       //SCL​
