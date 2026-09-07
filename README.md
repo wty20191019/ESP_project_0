@@ -4,7 +4,7 @@
 
 ## 项目概述
 
-本项目实现了一个完整的 FT8/FT4 弱信号数字模式终端，可用于业余无线电通信。系统通过 WM8978 音频芯片进行 12kHz 全双工音频采集和播放，使用 8-GFSK 调制方式实现 FT8/FT4 协议的编码发射和解码接收。
+本项目实现了一个完整的 FT8/FT4 弱信号数字模式终端，可用于业余无线电通信。系统通过 WM8978 音频芯片进行 12kHz 全双工音频采集和播放，使用 8-GFSK 调制方式实现 FT8/FT4 协议的编码发射和解码接收。此外，系统集成了 GNSS 模块，提供高精度的时间同步和定位功能，支持 UTC 对齐和本地时区转换。
 
 ### 主要特性
 
@@ -14,6 +14,9 @@
 - **精确时序**：严格对齐 UTC 时隙边界，支持奇偶时隙交替
 - **GFSK 调制**：高斯成形 8-GFSK 波形，占用带宽约 50Hz
 - **硬件加速**：PSRAM 波形预生成，优化的 FFT 解码
+- **GPS 定位**：支持多星座 GNSS 模块，提供位置、速度、航向和时间信息
+- **PPS 同步**：GPS 秒脉冲用于精确时钟同步和时隙对齐
+- **时区转换**：支持 UTC 到本地时区的时间转换，自动处理跨日、跨月、跨年
 - **LCD 显示**：1.8 寸 ST7735 TFT 彩屏（128×160），SPI+DMA 高速刷新
 - **按键输入**：7 键 GPIO 扫描，支持单击和长按检测
 
@@ -62,6 +65,14 @@
 | KEY_SET | GPIO41 | 设置 |
 | KEY_RST | GPIO47 | 复位 |
 
+**GNSS 模块（GPS）**
+
+| 功能 | GPIO | 说明 |
+|------|------|------|
+| GNSS_TXD | GPIO17 | ESP32-S3 UART TX → GNSS RX |
+| GNSS_RXD | GPIO18 | ESP32-S3 UART RX ← GNSS TX |
+| PPS_GPIO | GPIO9 | GNSS 秒脉冲输入（上升沿检测） |
+
 **状态指示**
 
 | 功能 | GPIO | 说明 |
@@ -82,13 +93,17 @@ ESP_project_0/
 ├── partitions-16MiB.csv           # 16MiB Flash 分区表
 ├── dependencies.lock              # 组件依赖锁定文件
 ├── main/                          # 应用主模块
-│   ├── main.c                     # 入口：app_main()，配置并启动 ft8_app、LCD、按键、LED
+│   ├── main.c                     # 入口：app_main()，配置并启动 ft8_app、LCD、按键、LED、GPS
 │   ├── ft8_app.c                  # 核心应用控制器：RX/TX 双任务调度
 │   ├── ft8_app.h                  # ft8_app 接口定义
 │   ├── CMakeLists.txt             # main 组件构建文件
 │   └── idf_component.yml          # 组件依赖声明
 ├── components/
 │   ├── BSP/                       # 板级支持包
+│   │   ├── GPS/                   # GNSS 模块驱动
+│   │   │   ├── gps.c/.h           # UART+NMEA 解析+PPS 同步
+│   │   │   ├── nmea.c/.h          # NMEA 语句解析器
+│   │   │   └── uart.c/.h          # UART 通信层
 │   │   ├── wm8978/                # WM8978 音频编解码器驱动
 │   │   │   ├── wm8978.c/.h        # 寄存器逻辑层（软件缓存表）
 │   │   │   ├── wm8978_i2c.c/.h    # I2C 总线驱动
@@ -194,6 +209,105 @@ ESP_project_0/
 - 注册回调函数：`key_init(callback, user_data)`
 - 回调参数：`key_id_t key_id, key_event_t event, void *user_data`
 
+### 6. GPS/GNSS 模块 (`components/BSP/GPS/`)
+
+多星座 GNSS 接收模块，支持 UART 通信、NMEA 解析和 PPS 秒脉冲同步：
+
+**硬件接口**
+- UART1：115200 波特率，8N1
+- PPS 中断：GPIO9 上升沿触发
+- 支持多星座：GPS（GP）、GLONASS（GL）、Galileo（GA）、北斗（GB）、QZSS（GQ）、SBAS（GS）
+
+**NMEA 语句支持**
+- `GGA`：定位信息（时间、经纬度、海拔、卫星数、定位质量）
+- `RMC`：推荐最小定位数据（时间、日期、速度、航向）
+- `GLL`：地理位置（经纬度、时间）
+- `GSA`：卫星状态（定位类型、精度因子、参与定位卫星）
+- `VTG`：地面速度和航向
+- `ZDA`：时间和日期数据
+- `TXT`：文本消息（天线状态）
+
+**数据结构**
+```c
+typedef struct {
+    bool     fix_valid;       /* 定位有效标志 */
+    uint8_t  fix_quality;     /* GGA 定位质量 */
+    uint8_t  fix_type;        /* GSA 定位类型：2=2D，3=3D */
+    uint8_t  satellites;      /* 使用卫星总数 */
+    double   latitude;        /* 纬度（十进制度） */
+    double   longitude;       /* 经度（十进制度） */
+    float    altitude_m;      /* 海拔（米） */
+    float    speed_kmh;       /* 速度（km/h） */
+    float    course_deg;      /* 航向（度） */
+    float    pdop;            /* 位置精度因子 */
+    float    hdop;            /* 水平精度因子 */
+    float    vdop;            /* 垂直精度因子 */
+    /* ... 时间、日期、星座信息、PPS 等 */
+} gps_info_t;
+```
+
+**API 接口**
+- `gps_init()`：初始化 GPS 模块
+- `gps_deinit()`：反初始化
+- `gps_get_info(&info)`：获取当前快照（线程安全）
+- `gps_set_pps_callback(cb, arg)`：注册 PPS 秒脉冲回调
+- `gps_set_data_callback(cb, arg)`：注册数据更新回调
+- `gps_log_info()`：打印调试信息
+
+**使用示例**
+```c
+// 注册 PPS 回调（用于时钟同步）
+void my_pps_cb(int64_t edge_boot_us, uint32_t seq,
+               const gps_info_t *gps, void *arg) {
+    // 处理秒脉冲，对齐本地时钟
+}
+
+gps_set_pps_callback(my_pps_cb, NULL);
+gps_init();
+
+// 主循环中获取位置信息
+for (;;) {
+    gps_info_t info;
+    gps_get_info(&info);
+    if (info.fix_valid) {
+        printf("位置: %.6f, %.6f\n", info.latitude, info.longitude);
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+}
+```
+
+### 7. 时区转换模块 (`main/main.c`)
+
+UTC 到本地时区的时间转换功能，支持任意时区偏移：
+
+**功能特性**
+- 支持正负时区偏移（-12 到 +14 小时）
+- 自动处理跨日、跨月、跨年
+- 考虑闰年和各月份天数差异
+
+**API 接口**
+```c
+void utc_to_local(const gps_info_t *utc, int tz_h, gps_info_t *local);
+```
+
+**参数说明**
+- `utc`：UTC 时间源（必须包含 year/month/day/hour）
+- `tz_h`：时区偏移（小时，正数为东时区，负数为西时区）
+- `local`：输出本地时间
+
+**使用示例**
+```c
+gps_info_t utc_info, local_info;
+gps_get_info(&utc_info);
+
+// 转换为北京时间（UTC+8）
+utc_to_local(&utc_info, 8, &local_info);
+
+printf("北京时间: %04d-%02d-%02d %02d:%02d:%02d\n",
+       local_info.year, local_info.month, local_info.day,
+       local_info.hour, local_info.minute, local_info.second);
+```
+
 ## 数据流
 
 ### 接收链路
@@ -207,6 +321,32 @@ ESP_project_0/
     → ftx_decode_candidate() LDPC 解码
     → ftx_message_decode() 还原呼号文本
   → ESP_LOGI 输出解码结果
+```
+
+### GPS 数据流
+
+```
+GNSS 模块 → UART1 RX (115200, 8N1)
+  → GPS UART 任务读取 NMEA 数据流
+  → NMEA 解析器（GGA/RMC/GLL/GSA/VTG/ZDA/TXT）
+  → 合并到 gps_info_t 快照结构体
+  → PPS 上升沿触发 GPIO 中断
+    → 记录 esp_timer 时间戳
+    → 投递到 PPS 任务
+    → 调用注册的 PPS 回调函数
+  → 调用方可通过 gps_get_info() 获取一致性快照
+```
+
+### 时区转换数据流
+
+```
+GPS UTC 时间 → utc_to_local(utc_info, tz_h, local_info)
+  → 检查时区偏移是否跨日
+    → 计算目标小时（0~23）
+    → 如跨日则调整日期
+      → 调用 days_in_month() 获取当月天数
+      → 处理跨月、跨年
+  → 输出本地时间到 local_info
 ```
 
 ### 发射链路
@@ -223,6 +363,8 @@ ESP_project_0/
 ```
 
 ## 配置参数
+
+### FT8/FT4 应用配置
 
 在 `main/main.c` 的 `app_main()` 中配置 `ft8_app_config_t` 结构体：
 
@@ -260,6 +402,39 @@ cfg.rx_time_osr = 2;                // 时间细分
 cfg.rx_freq_osr = 2;                // 频率细分
 cfg.max_candidates = 140;            // 每时隙最大候选数
 cfg.ldpc_iterations = 25;           // LDPC 最大迭代次数
+```
+
+### GPS 模块配置
+
+GPS 模块的引脚和参数在 `components/BSP/GPS/gps.h` 中定义：
+
+```c
+// 引脚定义（可在包含头文件前覆盖）
+#define GNSS_TXD        GPIO_NUM_17   /* S3 TX -> GNSS RX */
+#define GNSS_RXD        GPIO_NUM_18   /* S3 RX <- GNSS TX */
+#define PPS_GPIO        GPIO_NUM_9    /* PPS 上升沿检测 */
+
+// UART 配置
+#define GPS_UART_NUM    1             /* 使用 UART1 */
+#define GPS_UART_BAUD   115200        /* 波特率 */
+
+// 性能参数
+#define GPS_SYS_MAX     6             /* 最多跟踪的星座数 */
+#define GPS_SV_PER_SYS  12            /* 每个星座最多卫星数 */
+```
+
+### 时区转换配置
+
+时区转换功能在 `main/main.c` 中使用：
+
+```c
+// 时区偏移（小时）
+int timezone_hours = 8;  // 北京时间 UTC+8
+
+// 转换 UTC 到本地时间
+gps_info_t utc_info, local_info;
+gps_get_info(&utc_info);
+utc_to_local(&utc_info, timezone_hours, &local_info);
 ```
 
 ## 构建与烧录
@@ -349,6 +524,53 @@ idf.py monitor
 
 8. **SPI 时钟**：LCD SPI 默认 40MHz，ST7735 标称 ~15MHz，实测可跑更高。如遇显示异常可降低时钟（修改 `lcd_init.h` 中的 `LCD_SPI_CLK_HZ`）。
 
+9. **已知问题**：当前代码存在一些需要优化的地方，详见 `TODO.md` 文件中的待办事项列表。
+
+## 开发计划
+
+本项目持续改进中，当前计划的主要改进方向：
+
+### 短期计划（1-2 周）
+
+**🔴 高优先级修复**
+- 修复 GPS 模块数组访问线程安全问题
+- 优化时区转换函数边界条件处理
+
+**🟡 中优先级优化**
+- 实现 LCD 帧缓冲内存释放机制
+- 重构静态初始化标志，使用全局状态管理
+- 评估并调整编译器优化级别（-O3 → -O2）
+
+### 中期计划（1-2 月）
+
+**代码质量提升**
+- 精简组件依赖声明
+- 添加 GPS 互斥锁清理
+- 统一代码注释语言为中文
+
+**测试体系建设**
+- 添加 GPS NMEA 解析单元测试
+- 添加时区转换边界条件测试
+- 添加 FT8/FT4 编解码正确性测试
+
+### 长期计划（3-6 月）
+
+**文档完善**
+- 使用 Doxygen 生成 API 文档
+- 绘制系统架构图和模块依赖关系图
+- 补充使用示例和最佳实践
+
+**性能优化**
+- 优化 LCD 刷新性能（DMA 传输、局部刷新、双缓冲）
+- 优化 GPS 解析性能（查找表、高效字符串处理、结果缓存）
+
+**功能扩展**
+- 添加日志记录和回放功能
+- 添加配置文件支持
+- 添加远程控制接口
+
+详细任务列表和进度追踪请参考 `TODO.md` 文件。
+
 ## 开发指南
 
 ### 修改硬件引脚
@@ -359,6 +581,7 @@ idf.py monitor
 - LED 引脚：`components/BSP/led/led.h:5`
 - LCD 引脚：`components/LCD_1.8_st7735/lcd_init.h:36-53`
 - 按键引脚：`components/BSP/key/key.h:11-17`
+- GPS 引脚：`components/BSP/GPS/gps.h:33-41`（GNSS_TXD、GNSS_RXD、PPS_GPIO）
 
 ### 调整发射参数
 
@@ -370,6 +593,25 @@ idf.py monitor
 2. **添加新的消息模式**：扩展 `ft8_app_msg_mode_t` 枚举和 `tx_encode_message()` 函数
 3. **添加 UI 显示**：使用 LCD API（`LCD_ShowString`、`LCD_ShowIntNum` 等）显示解码结果
 4. **添加按键处理**：在 `key_init` 回调中处理按键事件，实现菜单导航或参数调整
+5. **添加 GPS 数据使用**：
+   ```c
+   // 获取 GPS 位置信息用于自动定位
+   gps_info_t info;
+   gps_get_info(&info);
+   if (info.fix_valid) {
+       // 使用 info.latitude、info.longitude 进行定位相关功能
+   }
+   ```
+6. **添加 PPS 同步**：
+   ```c
+   // 使用 PPS 进行精确时隙对齐
+   void pps_sync_callback(int64_t edge_boot_us, uint32_t seq,
+                          const gps_info_t *gps, void *arg) {
+       // 计算下一个时隙的精确发射时间
+       // edge_boot_us 是 PPS 上升沿的微秒时间戳
+   }
+   gps_set_pps_callback(pps_sync_callback, NULL);
+   ```
 
 ## 故障排除
 
@@ -386,12 +628,17 @@ idf.py monitor
 - **发射无信号**：检查 I2S 接线、发射电平、时隙配置
 - **LCD 无显示**：检查 SPI 接线、背光引脚、CS/DC/RST 控制信号
 - **按键无响应**：检查 GPIO 接线、上拉电阻、回调函数注册
+- **GPS 无定位**：检查 UART 接线（TX/RX 是否反接）、天线连接、波特率设置
+- **GPS 数据不更新**：检查 NMEA 语句格式、UART 波特率、GPS 模块是否正常输出
+- **PPS 无中断**：检查 PPS GPIO 接线、中断优先级配置
 
 ### 性能优化
 
 - 增加 `rx_time_osr` 和 `rx_freq_osr` 可提高解码灵敏度，但增加 CPU 负载
 - 减少 `max_candidates` 可降低解码计算量
 - 使用 PSRAM 可释放内部 SRAM 给栈和堆使用
+- GPS 模块：根据实际需求调整 `GPS_UART_BAUD`，高波特率可提高数据更新率但增加 CPU 负载
+- 时区转换：如需频繁转换，可缓存 `days_in_month` 结果减少重复计算
 
 ## 参考资料
 
@@ -400,7 +647,6 @@ idf.py monitor
 - [ESP-IDF 编程指南](https://docs.espressif.com/projects/esp-idf/zh_CN/latest/esp32s3/)
 - [WM8978 数据手册](https://www.wolfsonmicro.com/products/WM8978)
 - [ST7735 数据手册](https://www.st.com/resource/en/datasheet/st7735.pdf)
-
 
 ## 贡献
 
