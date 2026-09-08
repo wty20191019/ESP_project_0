@@ -390,7 +390,7 @@ void app_main(void)
     cfg.rx_enable           = true;                         /* 持续解码 */
     cfg.utc_enable          = true;                         /* 总开关：按 UTC 对齐时隙 */
     cfg.gps_utc_enable      = true;                         /* 选择使用 GPS 的 UTC 时间/日期对齐 */
-    cfg.gps_use_pps         = true;                         /* true=用 PPS 精对齐; false=不用PPS, NMEA粗对齐 */
+    cfg.gps_use_pps         = false;                        /* true=用 PPS 精对齐; false=不用PPS, NMEA粗对齐 */
     cfg.tx_slot_parity      = 0;                            /* 0=偶时隙发 / 1=奇时隙发，自动与对端交替 */
     cfg.tx_delay_ms         = 500;                          /* 本台时隙内再延时发射 */
     cfg.rx_parse_ms         = 100;                          /* 每个时隙结束前静默期(ms)，用于整窗解析 */    
