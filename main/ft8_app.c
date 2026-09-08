@@ -471,19 +471,22 @@ static void ft8_rx_task(void *arg)
             }
             got += (int)rd;
         }
+        /* 时隙边界处理放在“喂瀑布之前”：
+         * 用本块读完后时刻判断归属，一旦跨入新时隙，先把上一时隙整窗解码并
+         * reset，再把本块作为新时隙窗口的第 1 块。这样窗口起点只会落在槽边界
+         * 之前(最多早 1 块)，绝不会丢掉槽边界之后消息开头的那几个符号——
+         * 否则紧贴时隙起点发射(如本机自收)会因首块丢失而时好时坏解不出。 */
+        int64_t now_us = esp_timer_get_time();
+        int64_t slot = now_us / slot_us;
+        if (slot != last_slot) {
+            int64_t prev_slot = last_slot;
+            last_slot = slot;
+            if (s_cfg.rx_enable && prev_slot >= 0) rx_decode_slot(&mon, prev_slot);
+        }
+
         if (s_cfg.rx_enable) {
             for (int i = 0; i < sym_samples; i++) fr[i] = (float)ablk[i * 2] * (1.0f / 32768.0f);
             monitor_process(&mon, fr);
-        }
-
-        /* 时隙边界：上一时隙收齐 -> 解析 */
-        int64_t now_us = esp_timer_get_time();
-        int64_t slot = now_us / slot_us;
-        if (slot != last_slot)
-        {
-            int64_t prev_slot = last_slot;
-            last_slot = slot;
-            if (s_cfg.rx_enable) rx_decode_slot(&mon, prev_slot);
         }
 
         /* 每1000ms状态 */
