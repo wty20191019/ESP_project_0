@@ -309,6 +309,52 @@ static void hash_save(const char *callsign, uint32_t n22)
 }
 static ftx_callsign_hash_interface_t s_hash_if = { hash_lookup, hash_save };
 
+/* 估算一条已解码消息的信号强度(近似 FT8/FT4 的 SNR，折算到 2500Hz 参考带宽)：
+ *  - 信号 dB：整条消息在实际发送 tone 频点上的平均幅度；
+ *  - 噪声 dB：同一符号内其余 n_tones-1 个 tone 频点的平均幅度(本地参考)；
+ *  - 结果再减 10*log10(2500/bin_bw_hz)(FT8≈26dB，FT4≈21dB)折算到 2500Hz。
+ * 仅用于日志/监视显示，非精确计量。解码失败或数据不足返回 NAN。 */
+static float rx_measure_snr(const ftx_waterfall_t *wf, const ftx_candidate_t *cand,
+                            const uint8_t *tones, int n_syms, int n_tones,
+                            float bin_bw_hz)
+{
+    if (wf == NULL || wf->mag == NULL || cand == NULL || tones == NULL)
+        return NAN;
+    if (n_tones < 2 || bin_bw_hz <= 0.0f || cand->time_offset < 0 || cand->freq_offset < 0)
+        return NAN;
+    if (cand->freq_offset + n_tones > wf->num_bins)
+        return NAN;
+
+    int base = cand->time_offset;
+    base = (base * wf->time_osr + cand->time_sub) * wf->freq_osr + cand->freq_sub;
+    base = base * wf->num_bins + cand->freq_offset;
+
+    double sum_sig = 0.0, sum_nse = 0.0;
+    int n_sig = 0, n_nse = 0;
+
+    for (int s = 0; s < n_syms; s++) {
+        int block_abs = cand->time_offset + s;   /* 消息符号 s 对应的捕获块 */
+        if (block_abs < 0 || block_abs >= wf->num_blocks) continue;
+        const WF_ELEM_T *p = wf->mag + base + (size_t)s * wf->block_stride;
+        int t = tones[s];                        /* 该符号实际发送的 tone 序号 */
+        if (t < 0 || t >= n_tones) continue;
+        sum_sig += WF_ELEM_MAG(p[t]);
+        n_sig++;
+        for (int b = 0; b < n_tones; b++) {
+            if (b == t) continue;
+            sum_nse += WF_ELEM_MAG(p[b]);
+            n_nse++;
+        }
+    }
+    if (n_sig < 4 || n_nse < n_sig)
+        return NAN;
+
+    /* 单 bin 噪声折算到 2500Hz 参考带宽：+10*log10(2500/bin_bw_hz) */
+    float corr = 10.0f * log10f(2500.0f / bin_bw_hz);
+    float snr_db = (float)(sum_sig / n_sig - sum_nse / n_nse) - corr;
+    return snr_db;
+}
+
 /* ============================================================
  * RX：每拍读一拍音频喂瀑布；时隙边界即整窗解析(去重)
  * ============================================================ */
@@ -367,9 +413,19 @@ static void rx_decode_slot(monitor_t *mon, int64_t prev_slot)
                      (cands[i].freq_offset + cands[i].freq_sub / (float)f_osr) * bin_hz;
         float t_s = (cands[i].time_offset + cands[i].time_sub / (float)t_osr) * sym_period;
 
+        /* 用重编码得到的 tone 序列反查瀑布，估算信号强度(SNR, 2500Hz 带宽) */
+        uint8_t tones[FT4_NN];
+        if (ft4) ft4_encode(msg.payload, tones);
+        else     ft8_encode(msg.payload, tones);
+        float snr_db = rx_measure_snr(&mon->wf, &cands[i], tones,
+                                      ft4 ? FT4_NN : FT8_NN, ft4 ? 4 : 8, bin_hz);
+        char snr_str[16];
+        if (isfinite(snr_db)) snprintf(snr_str, sizeof(snr_str), "%+.0fdB", snr_db);
+        else                  snprintf(snr_str, sizeof(snr_str), "--dB");
+
         s_stat_decoded++;
-        ESP_LOGI(T, "[RX] %s @%0.0fHz t=%0.2fs: %s",
-                 ft4 ? "FT4" : "FT8", (double)f_hz, (double)t_s, text);
+        ESP_LOGI(T, "[RX] %s @%0.0fHz t=%0.2fs SNR=%s: %s",
+                 ft4 ? "FT4" : "FT8", (double)f_hz, (double)t_s, snr_str, text);
     }
     monitor_reset(mon);
 }
