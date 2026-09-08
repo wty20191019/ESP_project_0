@@ -316,7 +316,7 @@ static void gps_time_task(void *arg)
         gps_info_t g;
         gps_get_info(&g);
 
-        if (g.time_valid && g.date_valid && g.pps_seq > 0)
+        if (g.time_valid && g.date_valid)
         {
             cfg.gps.valid       = true;
             cfg.gps.year        = g.year;
@@ -326,13 +326,14 @@ static void gps_time_task(void *arg)
             cfg.gps.minute      = g.minute;
             cfg.gps.second      = g.second;
             cfg.gps.millisecond = g.millisecond;
-            cfg.gps.pps_seq     = g.pps_seq;
+            cfg.gps.pps_seq     = g.pps_seq;          /* 没接 PPS 时为 0 */
             cfg.gps.pps_edge_us = g.pps_edge_us;
             if (!reported)
             {
-                ESP_LOGI(TAG, "GPS UTC 就绪: %04u-%02u-%02u %02u:%02u:%02u.%03u PPS#%lu",
+                ESP_LOGI(TAG, "GPS UTC 就绪: %04u-%02u-%02u %02u:%02u:%02u.%03u PPS#%s",
                          g.year, g.month, g.day, g.hour, g.minute, g.second,
-                         (unsigned)g.millisecond, (unsigned long)g.pps_seq);
+                         (unsigned)g.millisecond,
+                         g.pps_seq ? "有" : "无");
                 reported = true;
             }
         }
@@ -389,6 +390,7 @@ void app_main(void)
     cfg.rx_enable           = true;                         /* 持续解码 */
     cfg.utc_enable          = true;                         /* 总开关：按 UTC 对齐时隙 */
     cfg.gps_utc_enable      = true;                         /* 选择使用 GPS 的 UTC 时间/日期对齐 */
+    cfg.gps_use_pps         = true;                         /* true=用 PPS 精对齐; false=不用PPS, NMEA粗对齐 */
     cfg.tx_slot_parity      = 0;                            /* 0=偶时隙发 / 1=奇时隙发，自动与对端交替 */
     cfg.tx_delay_ms         = 500;                          /* 本台时隙内再延时发射 */
     cfg.rx_parse_ms         = 100;                          /* 每个时隙结束前静默期(ms)，用于整窗解析 */    

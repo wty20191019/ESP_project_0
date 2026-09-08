@@ -163,49 +163,64 @@ static bool gps_cfg_get(ft8_app_gps_time_t *out)
     return false;
 }
 
-/* 若启用 GPS UTC 且 GPS 时间+PPS 已就绪，则锁存一次 UTC 相位。
- * 为排除“PPS 已进到下一秒而 NMEA 时间还没更新”的短暂错位，这里要求两次
- * 连续采样里 pps_seq 与 UTC 秒同步前进相同步数，才认为 时间↔PPS 对应一致。 */
+/* 若启用 GPS UTC 且 GPS 时间已就绪，则锁存一次 UTC 相位。
+ *  - gps_use_pps=true：用 PPS 上升沿做亚秒精对齐；为排除“PPS 已进到下一秒而
+ *    NMEA 时间还没更新”的短暂错位，要求两次采样 pps_seq 与 UTC 秒同步前进。
+ *  - gps_use_pps=false：不用 PPS，把解析到该 UTC 秒的 esp_timer 时刻近似当作
+ *    该秒起点(NMEA 粗对齐，误差可达数百 ms~1s，仅适合无 PPS 场合)。 */
 static void utc_try_lock_gps(void)
 {
     if (s_utc_locked) return;
     if (!s_cfg.utc_enable || !s_cfg.gps_utc_enable) return;
 
+    const bool use_pps = s_cfg.gps_use_pps;
+
+    ft8_app_gps_time_t g;
+    if (!gps_cfg_get(&g) || !g.valid) return;
+    if (use_pps && g.pps_seq == 0) return;              /* 要求 PPS 但尚未收到 */
+
     static uint32_t prev_seq = 0;
     static uint8_t  prev_sec = 0;
     static bool     have_prev = false;
 
-    ft8_app_gps_time_t g;
-    if (!gps_cfg_get(&g) || g.pps_seq == 0) return;
-
-    if (!have_prev) {
+    if (use_pps) {
+        if (!have_prev) {
+            prev_seq = g.pps_seq;
+            prev_sec = g.second;
+            have_prev = true;
+            return;
+        }
+        uint32_t dseq = g.pps_seq - prev_seq;           /* PPS 前进步数 */
+        int dsec = (int)g.second - (int)prev_sec;
+        if (dsec < 0) dsec += 60;                       /* 跨分钟回绕 */
         prev_seq = g.pps_seq;
         prev_sec = g.second;
-        have_prev = true;
-        return;
+        if (dseq < 1 || dsec != (int)dseq) return;      /* 时间与 PPS 未同步前进 */
     }
 
-    uint32_t dseq = g.pps_seq - prev_seq;              /* PPS 前进步数 */
-    int dsec = (int)g.second - (int)prev_sec;
-    if (dsec < 0) dsec += 60;                          /* 跨分钟回绕 */
-    prev_seq = g.pps_seq;
-    prev_sec = g.second;
-    if (dseq < 1 || dsec != (int)dseq) return;         /* 时间与 PPS 未同步前进，暂不锁 */
-
     int64_t sec = utc_to_epoch_s(&g);
-    if (sec < 946684800LL) return;                     /* 早于 2000-01-01 视为无效 */
+    if (sec < 946684800LL) return;                      /* 早于 2000-01-01 视为无效 */
 
+    /* PPS 精对齐：校准点取 PPS 上升沿；NMEA 粗对齐：校准点取“当前解析时刻” */
+    int64_t edge_us = use_pps ? g.pps_edge_us : esp_timer_get_time();
+    bool    locked_now = false;
     portENTER_CRITICAL(&s_utc_mux);
     if (!s_utc_locked) {
         s_utc_locked    = true;
-        s_utc_edge_us   = g.pps_edge_us;
+        s_utc_edge_us   = edge_us;
         s_utc_edge_sec  = sec;
         s_utc_ok        = true;
+        locked_now      = true;
     }
     portEXIT_CRITICAL(&s_utc_mux);
-    ESP_LOGI(TAG, "GPS UTC 相位已校准: %04u-%02u-%02u %02u:%02u:%02u.%03u  PPS#%lu edge=%lldus",
-             g.year, g.month, g.day, g.hour, g.minute, g.second, g.millisecond,
-             (unsigned long)g.pps_seq, (long long)g.pps_edge_us);
+
+    if (locked_now) {
+        ESP_LOGI(TAG, "GPS UTC 相位已校准(%s): %04u-%02u-%02u %02u:%02u:%02u.%03u "
+                 "PPS#%lu edge=%lldus",
+                 use_pps ? "PPS" : "NMEA粗对齐",
+                 g.year, g.month, g.day, g.hour, g.minute, g.second, g.millisecond,
+                 (unsigned long)g.pps_seq, (long long)edge_us);
+    }
 }
 
 /* ============================================================
@@ -865,6 +880,7 @@ void ft8_app_config_default(ft8_app_config_t *cfg)
     cfg->tx_enable       = true;
     cfg->rx_enable       = true;
     cfg->utc_enable      = true;
+    cfg->gps_use_pps     = true;
     cfg->tx_slot_parity  = 0;
     cfg->tx_delay_ms     = 0;
     snprintf(cfg->callsign, sizeof(cfg->callsign), "BG7ABC");
