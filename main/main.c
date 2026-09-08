@@ -345,7 +345,7 @@ void app_main(void)
     cfg.rx_enable     = true;                               /* 持续解码 */
     cfg.utc_enable    = true;                               /* 时隙对齐 UTC(:00/:15/:30/:45)，需先 SNTP 校时 */
     cfg.tx_slot_parity = 0;                                 /* 0=偶时隙发 / 1=奇时隙发，自动与对端交替 */
-    cfg.tx_delay_ms   = 500;                                /* 本台时隙内再延时发射 */
+    cfg.tx_delay_ms   = 0;                                /* 本台时隙内再延时发射 */
     snprintf(cfg.callsign, sizeof(cfg.callsign), "BG7ZJW"); // 本机呼号
     snprintf(cfg.grid,     sizeof(cfg.grid),     "JO70");   // 本机网格
     cfg.tx.type           = FT8_APP_MSG_CQ;                 /* 第几类消息: CQ / CALL / REPORT / R_REPORT / RRR / RR73 / 73 */
@@ -360,11 +360,11 @@ void app_main(void)
     /* WM8978 编解码器参数(对应原硬编码的 ADDA(1,1)/Input(1,1,0)/MIC40/Output(1,0)/I2S(2,0)/HP(50,50)/SPK40，
      * 默认已一致，这里仅示例按需修改) */
     cfg.codec.mic_gain = 40; // MIC 增益 0~63(-12~+35.25dB，0.75dB/步)
-    cfg.codec.hp_vol_l = 50; // L声道耳机音量
-    cfg.codec.hp_vol_r = 50; // R声道耳机音量
-    cfg.codec.spk_vol  = 40; // 音响音量
-
-    if (ft8_app_start(&cfg) != ESP_OK) {
+    cfg.codec.hp_vol_l = 50; // L声道耳机音量 (0~63)
+    cfg.codec.hp_vol_r = 50; // R声道耳机音量 (0~63)
+    cfg.codec.spk_vol  = 40; // 音响音量 (0~63)
+    if (ft8_app_start(&cfg) != ESP_OK)
+    {
         ESP_LOGE(TAG, "ft8_app 启动失败");
         return;
     }
