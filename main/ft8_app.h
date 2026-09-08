@@ -29,11 +29,32 @@ extern "C" {
  *   回退到以上电时刻为起点的本地栅格(仅用于无网测试)。
  * ============================================================ */
 
-/** 消息构造方式：发给谁 */
+/**
+ * 发射消息类型：标准一次通联的 6 类内容。
+ * 文本一律以本机(呼号=callsign)为发送方视角拼接，格式为：
+ *   CQ 类    "CQ [修饰] <本机> <本机网格>"
+ *   其它类   "<目标呼号> <本机> <第三字段>"
+ */
 typedef enum {
-    FT8_APP_MSG_CQ = 0,     /*!< 呼叫 CQ：<CQ前缀> <呼号> <网格> */
-    FT8_APP_MSG_CALL,       /*!< 呼叫指定台：<目标呼号> <呼号> <网格> */
-} ft8_app_msg_mode_t;
+    FT8_APP_MSG_CQ = 0,     /*!< 第1类 CQ 呼叫：CQ [修饰] <本机呼号> <本机网格> */
+    FT8_APP_MSG_CALL,       /*!< 第2类 应答呼叫：<目标呼号> <本机呼号> <本机网格> */
+    FT8_APP_MSG_REPORT,     /*!< 第3类 信号报告：<目标呼号> <本机呼号> <±dB>，如 -10 */
+    FT8_APP_MSG_R_REPORT,   /*!< 第4类 R 回报告：<目标呼号> <本机呼号> R<±dB>，如 R-12 */
+    FT8_APP_MSG_RRR,        /*!< 第5类 RRR：<目标呼号> <本机呼号> RRR */
+    FT8_APP_MSG_RR73,       /*!< 第5类 RR73(一步结束通联)：<目标呼号> <本机呼号> RR73 */
+    FT8_APP_MSG_73,         /*!< 第6类 73：<目标呼号> <本机呼号> 73 */
+} ft8_app_msg_type_t;
+
+/** 单次发射的消息参数(TX 任务每个本台时隙前重新读取，可运行中热切换) */
+typedef struct {
+    ft8_app_msg_type_t type;    /*!< 第几类标准消息(见上) */
+    char call_to[16];           /*!< 目标呼号(类型 2~6 用)，如 "BG5ABC"；CQ 类忽略 */
+    char cq_modifier[8];        /*!< CQ 修饰(仅 CQ 类用)：""、"DX"、"WW"、"TEST" 等，
+                                 *    标准 FT8 无法表达时会自动回退为纯 CQ */
+    int  rst_db;                /*!< 信号报告 dB(仅 REPORT / R_REPORT 类用)，
+                                 *    如 -12；本库可编码范围约 ±30(再大与 RRR/RR73/73
+                                 *    特殊值冲突)，超出会被截断并告警 */
+} ft8_app_tx_msg_t;
 
 /** FT8/FT4 应用配置结构体 */
 typedef struct {
@@ -53,11 +74,8 @@ typedef struct {
     char callsign[16];          /*!< 本机呼号，如 "BG7ABC" */
     char grid[8];               /*!< 本机网格，如 "JO70" */
 
-    /* ---- 消息内容 ---- */
-    ft8_app_msg_mode_t msg_mode;    /*!< CQ 呼叫 / 呼叫指定台 */
-    char call_to[16];               /*!< 呼叫目标呼号(仅 CALL 模式用)，如 "BG5ABC" */
-    char cq_modifier[8];            /*!< CQ 修饰：""、"DX"、"WW"、"TEST" 等(仅 CQ 模式)。
-                                     *    若标准 FT8 无法表达会自动回退为纯 CQ */
+    /* ---- 消息内容(可运行中热切换，见 ft8_app_tx_msg_set) ---- */
+    ft8_app_tx_msg_t tx;
 
     /* ---- 音频(发射，微观层) ---- */
     float audio_freq_hz;        /*!< tone0 中心频率 Hz(常用 1200/1500)，8-GFSK 高斯成形 */
@@ -76,6 +94,16 @@ typedef struct {
 
 /** 填充默认配置(FT8 / BG7ABC / JO70 / 纯 CQ / UTC 偶时隙 / 0 延时) */
 void ft8_app_config_default(ft8_app_config_t *cfg);
+
+/**
+ * @brief 运行中热切换 TX 发射消息(线程安全)
+ *
+ * 在任一其它任务里修改 type/call_to/rst_db 等后调用，TX 任务会在下一个
+ * 本台时隙前重新编码并生成波形，无需重启 FT8 应用。
+ *
+ * @param tx 新的消息参数(会被复制)
+ */
+void ft8_app_tx_msg_set(const ft8_app_tx_msg_t *tx);
 
 /**
  * @brief 启动 FT8/FT4 应用任务(配置会被复制)

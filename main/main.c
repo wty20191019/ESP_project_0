@@ -345,10 +345,12 @@ void app_main(void)
     cfg.utc_enable    = true;                /* 时隙对齐 UTC(:00/:15/:30/:45)，需先 SNTP 校时 */
     cfg.tx_slot_parity = 0;                  /* 0=偶时隙发 / 1=奇时隙发，自动与对端交替 */
     cfg.tx_delay_ms   = 500;                 /* 本台时隙内再延时发射 */
-    snprintf(cfg.callsign, sizeof(cfg.callsign), "BG7ABC");
+    snprintf(cfg.callsign, sizeof(cfg.callsign), "BG7ZJW");
     snprintf(cfg.grid,     sizeof(cfg.grid),     "JO70");
-    cfg.msg_mode      = FT8_APP_MSG_CQ;      /* CQ 呼叫，或 FT8_APP_MSG_CALL 呼叫指定台 */
-    cfg.cq_modifier[0] = '\0';               /* "DX"/"WW"/"TEST"... */
+    cfg.tx.type           = FT8_APP_MSG_CQ;    /* 第几类消息: CQ / CALL / REPORT / R_REPORT / RRR / RR73 / 73 */
+    cfg.tx.cq_modifier[0] = '\0';              /* "DX"/"WW"/"TEST"... 仅 CQ 类用 */
+    //snprintf(cfg.tx.call_to, sizeof(cfg.tx.call_to), "");  /* 目标呼号(类型 2~6 用)，如 "BG5ABC" */
+    cfg.tx.rst_db         = -12;               /* 信号报告 dB(类型 3/4 用)：REPORT 发 -12，R_REPORT 发 R-12 */
     cfg.audio_freq_hz = 1500.0f;             /* 音频中心(8-GFSK tone0) */
     cfg.audio_level   = 0.10f;               /* 发射电平 */
     cfg.rx_f_max      = 3000.0f;             /* 解码频率上限 */
@@ -357,6 +359,12 @@ void app_main(void)
         ESP_LOGE(TAG, "ft8_app 启动失败");
         return;
     }
+
+    /* 运行中热切换发射内容(如按键/解码驱动 QSO 流程时)，下一本台时隙生效：
+     *     cfg.tx.type = FT8_APP_MSG_RR73;
+     *     snprintf(cfg.tx.call_to, sizeof(cfg.tx.call_to), "BG5ABC");
+     *     ft8_app_tx_msg_set(&cfg.tx);
+     */
 
     xTaskCreatePinnedToCore(LCD_task, "LCD", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(rgb_led_task, "rgb_led", 2048, NULL, 1, NULL, 0);
