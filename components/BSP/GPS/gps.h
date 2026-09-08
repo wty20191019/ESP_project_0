@@ -44,7 +44,7 @@
 #define GPS_UART_NUM    1             /* 使用 UART1 */
 #endif
 #ifndef GPS_UART_BAUD
-#define GPS_UART_BAUD   115200          /* 多数 GNSS 模块默认波特率 */
+#define GPS_UART_BAUD   9600          /* 多数 GNSS 模块默认波特率 */
 #endif
 
 /* ---------- 辅助类型 ---------- */

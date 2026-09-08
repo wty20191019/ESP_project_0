@@ -22,8 +22,9 @@
  *  TX 任务(ft8_tx)：按奇偶时隙调度，用 esp_timer 忙等到目标时刻
  *                  才开始整窗写入(避免被解码/其它负载拖后)，起始
  *                  误差收敛到毫秒级。
- *  RX 任务(ft8_rx)：每拍读 ADC 喂瀑布，持续接收(不因发射暂停)，
- *                  每次时隙边界结束即整窗解析一次(结果去重)。
+ *  RX 任务(ft8_rx)：每个时隙从时隙起点开始接收(喂瀑布)，到"时隙结束前
+ *                  一段静默期"即停止接收并解析本时隙，解析不占用下一时隙
+ *                  开头的采集窗口(与发射奇偶交替且紧贴时隙起点天然对齐)。
  *
  *  两个任务各自操作 I2S0 的 TX/RX 方向(全双工)，互不阻塞。
  *  波形：GFSK 高斯成形(官方 gen_ft8 算法)，PSRAM 预生成。
@@ -44,12 +45,32 @@
 
 static const char *TAG = "ft8_app";
 
-static ft8_app_config_t s_cfg;
+/* 配置为“引用”而非拷贝：ft8_app_start 只保存用户传入 cfg 的指针，任务持续
+ * 读取它。运行中想换发射消息时，直接改 cfg.tx.type / call_to / rst_db 即可，
+ * TX 任务下一个本台时隙前会自动重建波形，无需专用接口。 */
+static ft8_app_config_t *s_cfg_p = NULL;
+#define s_cfg (*s_cfg_p)
+
 static bool s_utc_ok = false;
 
 /* TX 运行状态(供 RX 每秒日志读取) */
 static volatile bool s_tx_busy = false;
 static volatile int64_t s_tx_next_us = 0;
+
+/* TX 波形缓存：波形由“影响消息内容/波形的配置字段”决定，字段变了才重建 */
+typedef struct {
+    ft8_app_tx_msg_t tx;        /*!< 消息类型与参数(第几类消息+相关参数) */
+    char callsign[16];          /*!< 本机呼号(消息文本用到) */
+    char grid[8];               /*!< 本机网格 */
+    float audio_freq_hz;        /*!< 波形载波 */
+    float audio_level;          /*!< 波形幅度 */
+} tx_wave_key_t;
+
+static int16_t *s_wave = NULL;           /* 当前待播波形(PSRAM)，每个本台时隙播放 */
+static size_t  s_wave_samples = 0;
+static bool    s_wave_valid = false;     /* 有可用波形(可能沿用上一帧旧消息) */
+static tx_wave_key_t s_wave_key;         /* 当前波形对应的配置字段快照 */
+static tx_wave_key_t s_last_err_key;     /* 最近一次编码失败的快照(用于去重告警) */
 
 /* 运行统计 */
 static uint32_t s_stat_slots = 0;
@@ -62,29 +83,93 @@ static int  app_nsym(void)               { return app_is_ft4() ? FT4_NN : FT8_NN
 static int64_t app_slot_us(void)         { return app_is_ft4() ? (int64_t)7500000 : (int64_t)15000000; }
 
 /* ============================================================
- * 发送消息：文本 -> payload -> tone 序列
+ * 发送消息：按 ft8_app_config_t.tx 决定第几类标准消息并取相关参数
+ *           文本 -> payload -> tone 序列
  * ============================================================ */
 static uint8_t s_tones[FT4_NN];
 
-static esp_err_t tx_encode_message(void)
+/* 读取“当前应发射内容”对应的配置字段快照(用户直接改 cfg 即反映到这里) */
+static void tx_key_get(tx_wave_key_t *k)
+{
+    k->tx = s_cfg.tx;
+    memcpy(k->callsign, s_cfg.callsign, sizeof(k->callsign));
+    memcpy(k->grid,     s_cfg.grid,     sizeof(k->grid));
+    k->audio_freq_hz = s_cfg.audio_freq_hz;
+    k->audio_level   = s_cfg.audio_level;
+}
+
+/* 两个快照是否一致(决定波形是否需要重建)；整块比较，避免未清零字符串越界 */
+static bool tx_key_eq(const tx_wave_key_t *a, const tx_wave_key_t *b)
+{
+    return memcmp(a, b, sizeof(*a)) == 0;
+}
+
+/* FT8 信号报告文本：±两位(如 -12 / +05)，R 报告加 "R" 前缀。
+ * 该库报告字段(irpt=35+db)在 -31~-34 会撞上 RRR/RR73/73/空 等特殊值，
+ * 因此只按 ±30 封顶(超出调用处已告警) */
+static void tx_format_rst(char *buf, size_t n, int db, bool with_r)
+{
+    int mag = (db < 0) ? -db : db;
+    if (mag > 30) mag = 30;
+    char sign = (db < 0) ? '-' : '+';
+    if (with_r) snprintf(buf, n, "R%c%02d", sign, mag);
+    else        snprintf(buf, n, "%c%02d", sign, mag);
+}
+
+static esp_err_t tx_encode_message(const ft8_app_tx_msg_t *tx)
 {
     ftx_message_t msg;
     char text[96];
     ftx_message_rc_t rc;
 
+    if (tx->type != FT8_APP_MSG_CQ && !tx->call_to[0]) {
+        ESP_LOGE(TAG, "消息类型 %d 需要设置目标呼号 tx.call_to", (int)tx->type);
+        return ESP_FAIL;
+    }
+
     ftx_message_init(&msg);
-    if (s_cfg.msg_mode == FT8_APP_MSG_CALL && s_cfg.call_to[0]) {
-        snprintf(text, sizeof(text), "%s %s %s", s_cfg.call_to, s_cfg.callsign, s_cfg.grid);
-        rc = ftx_message_encode(&msg, NULL, text);
-        if (rc == FTX_MESSAGE_RC_OK) goto ok;
+    switch (tx->type) {
+    case FT8_APP_MSG_CQ:                                   /* 1. CQ 呼叫 */
+        if (tx->cq_modifier[0]) {
+            snprintf(text, sizeof(text), "CQ %s %s %s",
+                     tx->cq_modifier, s_cfg.callsign, s_cfg.grid);
+            rc = ftx_message_encode(&msg, NULL, text);
+            if (rc == FTX_MESSAGE_RC_OK) goto ok;
+            ESP_LOGW(TAG, "FT8 无法表达 CQ %s，回退纯 CQ", tx->cq_modifier);
+        }
+        snprintf(text, sizeof(text), "CQ %s %s", s_cfg.callsign, s_cfg.grid);
+        break;
+
+    case FT8_APP_MSG_CALL:                                 /* 2. 应答报网格 */
+        snprintf(text, sizeof(text), "%s %s %s",
+                 tx->call_to, s_cfg.callsign, s_cfg.grid);
+        break;
+
+    case FT8_APP_MSG_REPORT:                               /* 3. 信号报告 -10 */
+    case FT8_APP_MSG_R_REPORT: {                           /* 4. R 回报告 R-12 */
+        char rst[8];
+        if (tx->rst_db > 30 || tx->rst_db < -30)
+            ESP_LOGW(TAG, "rst_db=%d 超出库可编码范围(约±30)，按 ±30 发送", tx->rst_db);
+        tx_format_rst(rst, sizeof(rst), tx->rst_db, tx->type == FT8_APP_MSG_R_REPORT);
+        snprintf(text, sizeof(text), "%s %s %s", tx->call_to, s_cfg.callsign, rst);
+        break;
     }
-    if (s_cfg.cq_modifier[0]) {
-        snprintf(text, sizeof(text), "CQ %s %s %s", s_cfg.cq_modifier, s_cfg.callsign, s_cfg.grid);
-        rc = ftx_message_encode(&msg, NULL, text);
-        if (rc == FTX_MESSAGE_RC_OK) goto ok;
-        ESP_LOGW(TAG, "FT8 无法表达 CQ %s，回退纯 CQ", s_cfg.cq_modifier);
+
+    case FT8_APP_MSG_RRR:                                  /* 5. RRR */
+        snprintf(text, sizeof(text), "%s %s RRR", tx->call_to, s_cfg.callsign);
+        break;
+    case FT8_APP_MSG_RR73:                                 /* 5. RR73 */
+        snprintf(text, sizeof(text), "%s %s RR73", tx->call_to, s_cfg.callsign);
+        break;
+    case FT8_APP_MSG_73:                                   /* 6. 73 */
+        snprintf(text, sizeof(text), "%s %s 73", tx->call_to, s_cfg.callsign);
+        break;
+
+    default:
+        ESP_LOGE(TAG, "未知 TX 消息类型 %d", (int)tx->type);
+        return ESP_FAIL;
     }
-    snprintf(text, sizeof(text), "CQ %s %s", s_cfg.callsign, s_cfg.grid);
+
     rc = ftx_message_encode(&msg, NULL, text);
     if (rc != FTX_MESSAGE_RC_OK) {
         ESP_LOGE(TAG, "消息编码失败: %s", text);
@@ -169,6 +254,50 @@ static int16_t *tx_build_wave(int nsym, int sym_samples, size_t *out_samples)
     return wave;
 }
 
+/* ============================================================
+ * TX 波形刷新：直接改的 cfg 影响发射内容时(消息类型/参数/呼号/网格/电平…)
+ * 则重新编码并重建波形。只在时隙之间的空闲期执行(时间充裕)。编码失败时
+ * 保留上一帧有效波形继续发射，避免出现"静默空拍"；返回 true = 有可用波形。
+ * ============================================================ */
+static bool tx_wave_refresh(void)
+{
+    tx_wave_key_t key;
+    tx_key_get(&key);
+
+    /* 与当前波形对应的配置一致 -> 无需重建 */
+    if (s_wave_valid && tx_key_eq(&key, &s_wave_key)) return true;
+
+    if (tx_encode_message(&key.tx) != ESP_OK) {
+        if (!s_wave_valid || !tx_key_eq(&key, &s_last_err_key)) {
+            ESP_LOGE(TAG, "TX 消息编码失败，%s",
+                     s_wave_valid ? "沿用上一帧有效波形" : "无可用波形，TX 停发");
+            s_last_err_key = key;
+        }
+        if (s_wave_valid) {
+            s_wave_key = key;   /* 已尝试过本次配置，避免每轮循环重复尝试刷屏 */
+            return true;
+        }
+        return false;
+    }
+
+    size_t n = 0;
+    int16_t *w = tx_build_wave(app_nsym(), app_sym_samples(), &n);
+    if (w == NULL) {
+        ESP_LOGE(TAG, "发射波形内存不足");
+        if (s_wave_valid) {
+            s_wave_key = key;   /* 同上：已尝试过，沿用旧波形 */
+            return true;
+        }
+        return false;
+    }
+    free(s_wave);
+    s_wave = w;
+    s_wave_samples = n;
+    s_wave_key = key;
+    s_wave_valid = true;
+    return true;
+}
+
 /* ---------------- 解码文本还原回调 ---------------- */
 static bool hash_lookup(ftx_callsign_hash_type_t type, uint32_t hash, char *callsign)
 {
@@ -181,25 +310,77 @@ static void hash_save(const char *callsign, uint32_t n22)
 }
 static ftx_callsign_hash_interface_t s_hash_if = { hash_lookup, hash_save };
 
+/* 估算一条已解码消息的信号强度(近似 FT8/FT4 的 SNR，折算到 2500Hz 参考带宽)：
+ *  - 信号 dB：整条消息在实际发送 tone 频点上的平均幅度；
+ *  - 噪声 dB：同一符号内其余 n_tones-1 个 tone 频点的平均幅度(本地参考)；
+ *  - 结果再减 10*log10(2500/bin_bw_hz)(FT8≈26dB，FT4≈21dB)折算到 2500Hz。
+ * 仅用于日志/监视显示，非精确计量。解码失败或数据不足返回 NAN。 */
+static float rx_measure_snr(const ftx_waterfall_t *wf, const ftx_candidate_t *cand,
+                            const uint8_t *tones, int n_syms, int n_tones,
+                            float bin_bw_hz)
+{
+    if (wf == NULL || wf->mag == NULL || cand == NULL || tones == NULL)
+        return NAN;
+    if (n_tones < 2 || bin_bw_hz <= 0.0f || cand->time_offset < 0 || cand->freq_offset < 0)
+        return NAN;
+    if (cand->freq_offset + n_tones > wf->num_bins)
+        return NAN;
+
+    int base = cand->time_offset;
+    base = (base * wf->time_osr + cand->time_sub) * wf->freq_osr + cand->freq_sub;
+    base = base * wf->num_bins + cand->freq_offset;
+
+    double sum_sig = 0.0, sum_nse = 0.0;
+    int n_sig = 0, n_nse = 0;
+
+    for (int s = 0; s < n_syms; s++) {
+        int block_abs = cand->time_offset + s;   /* 消息符号 s 对应的捕获块 */
+        if (block_abs < 0 || block_abs >= wf->num_blocks) continue;
+        const WF_ELEM_T *p = wf->mag + base + (size_t)s * wf->block_stride;
+        int t = tones[s];                        /* 该符号实际发送的 tone 序号 */
+        if (t < 0 || t >= n_tones) continue;
+        sum_sig += WF_ELEM_MAG(p[t]);
+        n_sig++;
+        for (int b = 0; b < n_tones; b++) {
+            if (b == t) continue;
+            sum_nse += WF_ELEM_MAG(p[b]);
+            n_nse++;
+        }
+    }
+    if (n_sig < 4 || n_nse < n_sig)
+        return NAN;
+
+    /* 单 bin 噪声折算到 2500Hz 参考带宽：+10*log10(2500/bin_bw_hz) */
+    float corr = 10.0f * log10f(2500.0f / bin_bw_hz);
+    float snr_db = (float)(sum_sig / n_sig - sum_nse / n_nse) - corr;
+    return snr_db;
+}
+
 /* ============================================================
- * RX：每拍读一拍音频喂瀑布；时隙边界即整窗解析(去重)
+ * RX：整窗解析一个时隙(带解码耗时预算，避免拖入下一时隙采集)
  * ============================================================ */
-static void rx_decode_slot(monitor_t *mon, int64_t prev_slot)
+static void rx_decode_slot(monitor_t *mon, int64_t prev_slot, int64_t budget_us)
 {
     const char *T = "ft8_app";
     const bool ft4 = app_is_ft4();
 
     if (!s_cfg.rx_enable) return;
 
+    const int64_t t0 = esp_timer_get_time();
+
     s_stat_slots++;
     const char *who = ((prev_slot & 1) == (s_cfg.tx_slot_parity & 1)) ? "本台发射时隙" : "对端接收时隙";
     ESP_LOGI(T, "[RX] 解析时隙 #%lld(%s) 结束，瀑布 %d/%d 块",
              (long long)prev_slot, who, mon->wf.num_blocks, mon->wf.max_blocks);
 
-    /* 去重缓存 */
-    static uint8_t seen[16][FTX_PAYLOAD_LENGTH_BYTES];
-    static int seen_count = 0;
-    static int seen_idx = 0;
+    /* 去重缓存：容量跟随 cfg.max_candidates(上限 140，与候选数组一致)。
+     * 放在函数内每次调用都是全新的 —— 即“每个时隙解析完自动作废/清空”，
+     * 只在本时隙内对多个候选重复解出的同一条消息去重，不再跨时隙吞重复。 */
+    int max_seen = (s_cfg.max_candidates > 0) ? s_cfg.max_candidates : 140;
+    if (max_seen > 140) max_seen = 140;
+    uint8_t seen[max_seen][FTX_PAYLOAD_LENGTH_BYTES];
+    int seen_count = 0;
+    int seen_idx = 0;
 
     const float sym_period = ft4 ? FT4_SYMBOL_PERIOD : FT8_SYMBOL_PERIOD;
     const float bin_hz = 1.0f / sym_period;
@@ -210,7 +391,14 @@ static void rx_decode_slot(monitor_t *mon, int64_t prev_slot)
     int n = ftx_find_candidates(&mon->wf,
                                 s_cfg.max_candidates > 0 ? s_cfg.max_candidates : 140,
                                 cands, 10);
+    bool budget_cut = false;
+    int  remaining = 0;
     for (int i = 0; i < n; i++) {
+        if (esp_timer_get_time() - t0 > budget_us) {
+            budget_cut = true;          /* 解析预算用尽：先保证下一时隙能按时开始接收 */
+            remaining = n - i;
+            break;
+        }
         ftx_message_t msg;
         ftx_decode_status_t st;
         if (!ftx_decode_candidate(&mon->wf, &cands[i],
@@ -232,18 +420,67 @@ static void rx_decode_slot(monitor_t *mon, int64_t prev_slot)
         }
         if (dup) continue;
         memcpy(seen[seen_idx], msg.payload, FTX_PAYLOAD_LENGTH_BYTES);
-        seen_idx = (seen_idx + 1) % 16;
-        if (seen_count < 16) seen_count++;
+        seen_idx = (seen_idx + 1) % max_seen;
+        if (seen_count < max_seen) seen_count++;
 
         float f_hz = s_cfg.rx_f_min +
                      (cands[i].freq_offset + cands[i].freq_sub / (float)f_osr) * bin_hz;
         float t_s = (cands[i].time_offset + cands[i].time_sub / (float)t_osr) * sym_period;
 
+        /* 用重编码得到的 tone 序列反查瀑布，估算信号强度(SNR, 2500Hz 带宽) */
+        uint8_t tones[FT4_NN];
+        if (ft4) ft4_encode(msg.payload, tones);
+        else     ft8_encode(msg.payload, tones);
+        float snr_db = rx_measure_snr(&mon->wf, &cands[i], tones,
+                                      ft4 ? FT4_NN : FT8_NN, ft4 ? 4 : 8, bin_hz);
+        char snr_str[16];
+        if (isfinite(snr_db)) snprintf(snr_str, sizeof(snr_str), "%+.0fdB", snr_db);
+        else                  snprintf(snr_str, sizeof(snr_str), "--dB");
+
         s_stat_decoded++;
-        ESP_LOGI(T, "[RX] %s @%0.0fHz t=%0.2fs: %s",
-                 ft4 ? "FT4" : "FT8", (double)f_hz, (double)t_s, text);
+        ESP_LOGI(T, "[RX] %s @%0.0fHz t=%0.2fs SNR=%s: %s",
+                 ft4 ? "FT4" : "FT8", (double)f_hz, (double)t_s, snr_str, text);
     }
+    if (budget_cut)
+        ESP_LOGW(T, "[RX] 解析预算 %lldms 用尽提前结束，剩余 %d 个候选未处理",
+                 (long long)(budget_us / 1000), remaining);
     monitor_reset(mon);
+}
+
+/* 丢弃一小段 RX 音频(在接收间隙也持续读取，防止 I2S DMA 积压，
+ * 从而保证下个时隙一开始读到的是实时信号、窗口起点紧贴时隙边界) */
+static void rx_discard_chunk(void)
+{
+    static uint8_t tmp[256];
+    size_t rd = 0;
+    (void)wm8978_i2s_read(tmp, sizeof(tmp), &rd, 2);
+}
+
+/* RX 每秒状态日志(供观察 TX/RX 节奏) */
+static void rx_status_log(const monitor_t *mon, int64_t now_us, int64_t slot)
+{
+    static int64_t last_log_us = 0;
+    const char *T = "ft8_app";
+    if (last_log_us == 0) last_log_us = now_us;
+    if (now_us - last_log_us < 1000000) return;
+    last_log_us = now_us;
+
+    const char *clock = (s_cfg.utc_enable && s_utc_ok) ? "UTC" : "本地";
+    const char *who = ((slot & 1) == (s_cfg.tx_slot_parity & 1)) ? "本台时隙" : "对端时隙";
+    if (s_tx_busy) {
+        ESP_LOGI(T, "[now] t=%lld.%03ds 时隙#%lld(%s) TX=发射中 RX=%d/%d块 已解%u(%u时隙) 时钟%s",
+                 (long long)(now_us / 1000000), (int)((now_us / 1000) % 1000),
+                 (long long)slot, who,
+                 mon->wf.num_blocks, mon->wf.max_blocks,
+                 (unsigned)s_stat_decoded, (unsigned)s_stat_slots, clock);
+    } else {
+        int64_t remain = (s_tx_next_us > now_us) ? (s_tx_next_us - now_us) / 1000 : 0;
+        ESP_LOGI(T, "[now] t=%lld.%03ds 时隙#%lld(%s) TX=待机(下次%lldms) RX=%d/%d块 已解%u(%u时隙) 时钟%s",
+                 (long long)(now_us / 1000000), (int)((now_us / 1000) % 1000),
+                 (long long)slot, who, (long long)remain,
+                 mon->wf.num_blocks, mon->wf.max_blocks,
+                 (unsigned)s_stat_decoded, (unsigned)s_stat_slots, clock);
+    }
 }
 
 static void ft8_rx_task(void *arg)
@@ -253,11 +490,12 @@ static void ft8_rx_task(void *arg)
     const bool ft4 = app_is_ft4();
     const int sym_samples = app_sym_samples();
     const int64_t slot_us = app_slot_us();
+    const int64_t block_us = (int64_t)sym_samples * 1000000LL / FT8_AUDIO_RATE;
 
     static int16_t ablk[MAX_SYMBOL_SAMPLES * 2];
     static float   fr[MAX_SYMBOL_SAMPLES];
 
-    monitor_t mon;
+    monitor_t mon = { 0 };
     if (s_cfg.rx_enable) {
         monitor_config_t mc = {
             .f_min = s_cfg.rx_f_min,
@@ -272,60 +510,80 @@ static void ft8_rx_task(void *arg)
                  ft4 ? "FT4" : "FT8", mon.wf.num_bins, mon.wf.max_blocks);
     }
 
-    int64_t last_slot = -1;
-    int64_t last_log_us = -1;
+    /* 时隙节奏：
+     *  - 每个时隙从“时隙起点”开始接收(喂瀑布)；
+     *  - 到“时隙结束前 parse_us”即停止接收，在末尾静默段解析本时隙，
+     *    解析不占用下一时隙开头的采集窗口，窗口起点永远紧贴时隙边界。
+     *  - parse_us 有下限(1.5s)，防止配置过小导致解码拖入下一时隙、
+     *    进而整槽跳过(表现为“本台发射时隙 RX=0”)。 */
+    const int64_t msg_us = (int64_t)app_nsym() * sym_samples * 1000000LL / FT8_AUDIO_RATE;
+    const int64_t margin_us = 300000;                  /* 对端起播/本机发射延时容差 */
+    int64_t parse_us = (int64_t)(s_cfg.rx_parse_ms > 0 ? s_cfg.rx_parse_ms : 1500) * 1000;
+    if (parse_us < 1500000) parse_us = 1500000;        /* 解析期下限，保证每时隙都能按时解完 */
+    const int64_t max_parse_us = slot_us - (msg_us + margin_us);
+    if (parse_us > max_parse_us) parse_us = max_parse_us;   /* 不能挤占消息本身 */
+    const int64_t cap_us = slot_us - parse_us;         /* 每时隙采集时长 */
+
+    /* 解析预算：预留期再扣掉一个读块+余量，确保解码最晚在时隙边界前结束，
+     * 下一时隙(含本台发射时隙)的接收不会被拖慢/跳过 */
+    const int64_t guard_us = 300000;
+    int64_t budget_us = parse_us - block_us - guard_us;
+    if (budget_us < 100000) budget_us = 100000;
+    ESP_LOGI(T, "%s RX 节奏: 前%.2fs接收, 末尾预留%.2fs解析(预算%.2fs)",
+             ft4 ? "FT4" : "FT8",
+             (double)cap_us / 1e6, (double)parse_us / 1e6, (double)budget_us / 1e6);
 
     for (;;) {
-        /* 读一拍(全双工 RX，不因时隙/发射暂停) */
-        int bytes = sym_samples * 4;
-        int got = 0;
-        while (got < bytes) {
-            size_t rd = 0;
-            if (wm8978_i2s_read((uint8_t *)ablk + got, bytes - got, &rd, 1000) != ESP_OK || rd == 0) {
-                vTaskDelay(pdMS_TO_TICKS(5));
-                continue;
-            }
-            got += (int)rd;
-        }
-        if (s_cfg.rx_enable) {
-            for (int i = 0; i < sym_samples; i++) fr[i] = (float)ablk[i * 2] * (1.0f / 32768.0f);
-            monitor_process(&mon, fr);
+        /* 对齐到下一个时隙起点(期间读并丢弃旧音频，保持 DMA 不积压) */
+        int64_t now = esp_timer_get_time();
+        int64_t boundary = (now / slot_us + 1) * slot_us;
+        while (esp_timer_get_time() < boundary) {
+            rx_discard_chunk();
+            rx_status_log(&mon, esp_timer_get_time(), boundary / slot_us - 1);
+            vTaskDelay(pdMS_TO_TICKS(2));
         }
 
-        /* 时隙边界：上一时隙收齐 -> 解析 */
-        int64_t now_us = esp_timer_get_time();
-        int64_t slot = now_us / slot_us;
-        if (slot != last_slot) {
-            int64_t prev_slot = last_slot;
-            last_slot = slot;
-            if (s_cfg.rx_enable) rx_decode_slot(&mon, prev_slot);
+        const int64_t slot_id = boundary / slot_us;
+        const int64_t cap_end = boundary + cap_us;
+
+        /* 接收段：从时隙起点连续采集喂瀑布，直到 cap_end(时隙结束前 parse_us) */
+        now = esp_timer_get_time();
+        while (now < cap_end) {
+            int bytes = sym_samples * 4;
+            int got = 0;
+            while (got < bytes) {
+                size_t rd = 0;
+                if (wm8978_i2s_read((uint8_t *)ablk + got, bytes - got, &rd, 1000) != ESP_OK || rd == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    continue;
+                }
+                got += (int)rd;
+            }
+            if (s_cfg.rx_enable) {
+                for (int i = 0; i < sym_samples; i++) fr[i] = (float)ablk[i * 2] * (1.0f / 32768.0f);
+                monitor_process(&mon, fr);
+            }
+            now = esp_timer_get_time();
+            rx_status_log(&mon, now, slot_id);
         }
 
-        /* 每1000ms状态 */
-        if (now_us - last_log_us >= 1000000) {
-            last_log_us = now_us;
-            const char *clock = (s_cfg.utc_enable && s_utc_ok) ? "UTC" : "本地";
-            const char *who = ((slot & 1) == (s_cfg.tx_slot_parity & 1)) ? "本台时隙" : "对端时隙";
-            if (s_tx_busy) {
-                ESP_LOGI(T, "[now] t=%lld.%03ds 时隙#%lld(%s) TX=发射中 RX=%d/%d块 已解%u(%u时隙) 时钟%s",
-                         (long long)(now_us / 1000000), (int)((now_us / 1000) % 1000),
-                         (long long)slot, who,
-                         mon.wf.num_blocks, mon.wf.max_blocks,
-                         (unsigned)s_stat_decoded, (unsigned)s_stat_slots, clock);
-            } else {
-                int64_t remain = (s_tx_next_us > now_us) ? (s_tx_next_us - now_us) / 1000 : 0;
-                ESP_LOGI(T, "[now] t=%lld.%03ds 时隙#%lld(%s) TX=待机(下次%lldms) RX=%d/%d块 已解%u(%u时隙) 时钟%s",
-                         (long long)(now_us / 1000000), (int)((now_us / 1000) % 1000),
-                         (long long)slot, who, (long long)remain,
-                         mon.wf.num_blocks, mon.wf.max_blocks,
-                         (unsigned)s_stat_decoded, (unsigned)s_stat_slots, clock);
-            }
+        /* 停止接收：在时隙末尾静默段解析本时隙(之后自动等到下一时隙起点) */
+        rx_status_log(&mon, esp_timer_get_time(), slot_id);
+        if (s_cfg.rx_enable) rx_decode_slot(&mon, slot_id, budget_us);
+
+        int64_t after = esp_timer_get_time();
+        int64_t next_b = (slot_id + 1) * slot_us;
+        if (after > next_b) {
+            ESP_LOGW(T, "解析耗时超时隙尾部%lldms，可能错过时隙 #%lld 开头",
+                     (long long)((after - next_b) / 1000), (long long)(slot_id + 1));
         }
     }
 }
 
 /* ============================================================
- * TX：严格按目标时刻(esp_timer 本地栅格)发射整窗波形
+ * TX：严格按目标时刻(esp_timer 本地栅格)发射整窗波形。
+ *     每个本台时隙前读取 ft8_app_config_t.tx：运行中更改了"第几类消息"
+ *     或相关参数，就在空闲期重新编码并重建波形，下一时隙自动生效。
  * ============================================================ */
 static void ft8_tx_task(void *arg)
 {
@@ -339,13 +597,13 @@ static void ft8_tx_task(void *arg)
     const int parity = s_cfg.tx_slot_parity & 1;
     const bool fits = (delay_us + msg_us <= slot_us);
 
-    /* 预生成波形 */
-    int16_t *wave = NULL;
-    size_t wave_samples = 0;
-    if (s_cfg.tx_enable && fits && tx_encode_message() == ESP_OK) {
-        wave = tx_build_wave(nsym, sym_samples, &wave_samples);
+    if (s_cfg.tx_enable && !fits) {
+        ESP_LOGW(T, "发射延时+时长超时隙(%d.%03ds)，TX 关闭，仅接收",
+                 (int)(delay_us / 1000000), (int)((delay_us / 1000) % 1000));
+        s_cfg.tx_enable = false;
     }
-    if (s_cfg.tx_enable && wave == NULL) {
+    /* 启动时按初始配置预生成第一帧波形(失败则关闭 TX) */
+    if (s_cfg.tx_enable && !tx_wave_refresh()) {
         ESP_LOGE(T, "发射不可用(编码失败或内存不足)，TX 关闭");
         s_cfg.tx_enable = false;
     }
@@ -354,15 +612,17 @@ static void ft8_tx_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    if (!fits) {
-        ESP_LOGW(T, "发射延时+时长超时隙(%d.%03ds)，将跳过放不下的时隙",
-                 (int)(delay_us / 1000000), (int)((delay_us / 1000) % 1000));
-    }
 
     ESP_LOGI(T, "TX 任务启动: 奇偶时隙=%d 延时=%dms 时长=%.3fs",
              parity, (int)s_cfg.tx_delay_ms, (double)msg_us / 1000000.0);
 
     for (;;) {
+        /* 运行时改了类型/参数 -> 空闲期重建波形(见 tx_wave_refresh) */
+        if (!tx_wave_refresh()) {
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
         /* 找下一个“本台时隙”的可发射起点 */
         int64_t now = esp_timer_get_time();
         int64_t slot = now / slot_us;
@@ -370,79 +630,88 @@ static void ft8_tx_task(void *arg)
         for (int k = 0; k < 6; k++) {
             int64_t s = slot + k;
             if ((int)(s & 1) != parity) continue;              /* 只选本台时隙 */
-            if (!fits) break;                                  /* 放不下则不发 */
             int64_t st = s * slot_us + delay_us;
             if (st + msg_us <= (s + 1) * slot_us && st > now + 30000) {
                 target = st;
                 break;
             }
         }
-        if (target < 0) {          /* 本台时隙过近或放不下，等下一轮 */
+        if (target < 0) {          /* 本台时隙过近，等下一轮 */
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
         s_tx_next_us = target;
 
-        /* 先长睡到临近，再忙等到目标时刻，保证起播误差 <1ms */
+        /* 先长睡到临近，再忙等到目标时刻，保证起播误差 <1ms。
+         * 睡眠期间若发现 cfg 又被直接改过(热切换)，放弃本目标回外层重建，
+         * 确保"运行中改配置，下一本台时隙生效"不失约 */
         int64_t t = esp_timer_get_time();
+        bool stale = false;
         while (t < target - 30000) {
             vTaskDelay(pdMS_TO_TICKS(5));
             t = esp_timer_get_time();
+            tx_wave_key_t cur;
+            tx_key_get(&cur);
+            if (!tx_key_eq(&cur, &s_wave_key)) {
+                stale = true;
+                break;
+            }
         }
+        if (stale) continue;
         while (esp_timer_get_time() < target) { /* busy wait */ }
 
-    ESP_LOGI(T, "[TX] 时隙 #%lld 于 %d.%03ds 起播",
-             (long long)(target / slot_us),
-             (int)(target / 1000000), (int)((target / 1000) % 1000));
-    s_tx_busy = true;
+        ESP_LOGI(T, "[TX] 时隙 #%lld 于 %d.%03ds 起播",
+                 (long long)(target / slot_us),
+                 (int)(target / 1000000), (int)((target / 1000) % 1000));
+        s_tx_busy = true;
 
-    /* 整窗播放：把单声道 wave 逐块复制成双声道交织(L=R)写入 */
-    {
-        static int16_t st[MAX_SYMBOL_SAMPLES * 2];
-        size_t pos = 0;
-        while (pos < wave_samples) {
-            int n = (int)((wave_samples - pos) > MAX_SYMBOL_SAMPLES
-                          ? MAX_SYMBOL_SAMPLES : (wave_samples - pos));
-            for (int i = 0; i < n; i++) {
-                st[i * 2 + 0] = wave[pos + i];
-                st[i * 2 + 1] = wave[pos + i];
-            }
-            size_t bytes = (size_t)n * 4;
-            size_t sent = 0;
-            while (sent < bytes) {
-                size_t wr = 0;
-                esp_err_t err = wm8978_i2s_write((const uint8_t *)st + sent,
-                                                 bytes - sent, &wr, 2000);
-                if (err != ESP_OK || wr == 0) {
-                    ESP_LOGW(T, "I2S 写异常");
-                    vTaskDelay(pdMS_TO_TICKS(5));
-                    continue;
-                }
-                sent += wr;
-            }
-            pos += (size_t)n;
-        }
-
-        /* 冲刷：DMA 环内还有 ~0.12s 残余，空闲时可能被循环重放，
-         * 末尾补一整块全零，让残余与后续输出都固定为静音 */
-        memset(st, 0, sizeof(st));
+        /* 整窗播放：把单声道 s_wave 逐块复制成双声道交织(L=R)写入 */
         {
-            size_t bytes = sizeof(st);
-            size_t sent = 0;
-            while (sent < bytes) {
-                size_t wr = 0;
-                esp_err_t err = wm8978_i2s_write((const uint8_t *)st + sent,
-                                                 bytes - sent, &wr, 2000);
-                if (err != ESP_OK || wr == 0) {
-                    vTaskDelay(pdMS_TO_TICKS(5));
-                    continue;
+            static int16_t st[MAX_SYMBOL_SAMPLES * 2];
+            size_t pos = 0;
+            while (pos < s_wave_samples) {
+                int n = (int)((s_wave_samples - pos) > MAX_SYMBOL_SAMPLES
+                              ? MAX_SYMBOL_SAMPLES : (s_wave_samples - pos));
+                for (int i = 0; i < n; i++) {
+                    st[i * 2 + 0] = s_wave[pos + i];
+                    st[i * 2 + 1] = s_wave[pos + i];
                 }
-                sent += wr;
+                size_t bytes = (size_t)n * 4;
+                size_t sent = 0;
+                while (sent < bytes) {
+                    size_t wr = 0;
+                    esp_err_t err = wm8978_i2s_write((const uint8_t *)st + sent,
+                                                     bytes - sent, &wr, 2000);
+                    if (err != ESP_OK || wr == 0) {
+                        ESP_LOGW(T, "I2S 写异常");
+                        vTaskDelay(pdMS_TO_TICKS(5));
+                        continue;
+                    }
+                    sent += wr;
+                }
+                pos += (size_t)n;
+            }
+
+            /* 冲刷：DMA 环内还有 ~0.12s 残余，空闲时可能被循环重放，
+             * 末尾补一整块全零，让残余与后续输出都固定为静音 */
+            memset(st, 0, sizeof(st));
+            {
+                size_t bytes = sizeof(st);
+                size_t sent = 0;
+                while (sent < bytes) {
+                    size_t wr = 0;
+                    esp_err_t err = wm8978_i2s_write((const uint8_t *)st + sent,
+                                                     bytes - sent, &wr, 2000);
+                    if (err != ESP_OK || wr == 0) {
+                        vTaskDelay(pdMS_TO_TICKS(5));
+                        continue;
+                    }
+                    sent += wr;
+                }
             }
         }
-    }
-    s_tx_busy = false;
-    ESP_LOGI(T, "[TX] 发射完成，进入静默");
+        s_tx_busy = false;
+        ESP_LOGI(T, "[TX] 发射完成，进入静默");
     }
 }
 
@@ -460,15 +729,31 @@ void ft8_app_config_default(ft8_app_config_t *cfg)
     cfg->tx_delay_ms     = 0;
     snprintf(cfg->callsign, sizeof(cfg->callsign), "BG7ABC");
     snprintf(cfg->grid,     sizeof(cfg->grid),     "JO70");
-    cfg->msg_mode         = FT8_APP_MSG_CQ;
-    cfg->cq_modifier[0]   = 0;
-    cfg->audio_freq_hz    = 1200.0f;
+    cfg->tx.type           = FT8_APP_MSG_CQ;
+    cfg->tx.rst_db         = -12;   /* 仅 REPORT / R_REPORT 用，默认给个常用值 */
+
+    /* WM8978 初始化参数(对应原硬编码：ADDA(1,1) Input(1,1,0) MIC40 Out(1,0) I2S(2,0) HP(50,50) SPK40) */
+    cfg->codec.dac_en     = 1;
+    cfg->codec.adc_en     = 1;
+    cfg->codec.mic_en     = 1;
+    cfg->codec.linein_en  = 1;
+    cfg->codec.aux_en     = 0;
+    cfg->codec.mic_gain   = 40;
+    cfg->codec.out_dac    = 1;
+    cfg->codec.out_bypass = 0;
+    cfg->codec.i2s_fmt    = 2;
+    cfg->codec.i2s_len    = 0;
+    cfg->codec.hp_vol_l   = 50;
+    cfg->codec.hp_vol_r   = 50;
+    cfg->codec.spk_vol    = 40;
+
+    cfg->audio_freq_hz     = 1200.0f;
     cfg->audio_level      = 0.45f;
     cfg->rx_f_min         = 0.0f;
     cfg->rx_f_max         = 4000.0f;
     cfg->rx_time_osr      = 2;
     cfg->rx_freq_osr      = 2;
-    cfg->max_candidates   = 140;
+    cfg->max_candidates   = 60;  /*每时隙解码耗时 ≈ 候选数(max_candidates) × 每个候选迭代数(ldpc_iterations) × 单次迭代成本*/
     cfg->ldpc_iterations  = 25;
 }
 
@@ -481,20 +766,20 @@ esp_err_t ft8_app_start(const ft8_app_config_t *cfg)
         ESP_LOGW(TAG, "FT8 应用已在运行，忽略本次启动");
         return ESP_OK;
     }
-    s_cfg = *cfg;
+    s_cfg_p = (ft8_app_config_t *)cfg;   /* 引用而非拷贝：运行中直接改 cfg 即生效 */
 
     vTaskDelay(pdMS_TO_TICKS(200));
     if (WM8978_Init() != 0) {
         ESP_LOGE(TAG, "WM8978 初始化失败");
         return ESP_FAIL;
     }
-    WM8978_ADDA_Cfg(1, 1);
-    WM8978_Input_Cfg(1, 1, 0);
-    WM8978_MIC_Gain(40);
-    WM8978_Output_Cfg(1, 0);
-    WM8978_I2S_Cfg(2, 0);
-    WM8978_HPvol_Set(50, 50);
-    WM8978_SPKvol_Set(40);
+    WM8978_ADDA_Cfg(s_cfg.codec.dac_en, s_cfg.codec.adc_en);
+    WM8978_Input_Cfg(s_cfg.codec.mic_en, s_cfg.codec.linein_en, s_cfg.codec.aux_en);
+    WM8978_MIC_Gain(s_cfg.codec.mic_gain);
+    WM8978_Output_Cfg(s_cfg.codec.out_dac, s_cfg.codec.out_bypass);
+    WM8978_I2S_Cfg(s_cfg.codec.i2s_fmt, s_cfg.codec.i2s_len);
+    WM8978_HPvol_Set(s_cfg.codec.hp_vol_l, s_cfg.codec.hp_vol_r);
+    WM8978_SPKvol_Set(s_cfg.codec.spk_vol);
     ESP_ERROR_CHECK(wm8978_i2s_init(FT8_AUDIO_RATE));
     ESP_ERROR_CHECK(wm8978_i2s_start_rx());
     ESP_ERROR_CHECK(wm8978_i2s_start_tx());
