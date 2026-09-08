@@ -22,8 +22,9 @@
  *  TX 任务(ft8_tx)：按奇偶时隙调度，用 esp_timer 忙等到目标时刻
  *                  才开始整窗写入(避免被解码/其它负载拖后)，起始
  *                  误差收敛到毫秒级。
- *  RX 任务(ft8_rx)：每拍读 ADC 喂瀑布，持续接收(不因发射暂停)，
- *                  每次时隙边界结束即整窗解析一次(结果去重)。
+ *  RX 任务(ft8_rx)：每个时隙从时隙起点开始接收(喂瀑布)，到"时隙结束前
+ *                  一段静默期"即停止接收并解析本时隙，解析不占用下一时隙
+ *                  开头的采集窗口(与发射奇偶交替且紧贴时隙起点天然对齐)。
  *
  *  两个任务各自操作 I2S0 的 TX/RX 方向(全双工)，互不阻塞。
  *  波形：GFSK 高斯成形(官方 gen_ft8 算法)，PSRAM 预生成。
@@ -430,6 +431,42 @@ static void rx_decode_slot(monitor_t *mon, int64_t prev_slot)
     monitor_reset(mon);
 }
 
+/* 丢弃一小段 RX 音频(在接收间隙也持续读取，防止 I2S DMA 积压，
+ * 从而保证下个时隙一开始读到的是实时信号、窗口起点紧贴时隙边界) */
+static void rx_discard_chunk(void)
+{
+    static uint8_t tmp[256];
+    size_t rd = 0;
+    (void)wm8978_i2s_read(tmp, sizeof(tmp), &rd, 2);
+}
+
+/* RX 每秒状态日志(供观察 TX/RX 节奏) */
+static void rx_status_log(const monitor_t *mon, int64_t now_us, int64_t slot)
+{
+    static int64_t last_log_us = 0;
+    const char *T = "ft8_app";
+    if (last_log_us == 0) last_log_us = now_us;
+    if (now_us - last_log_us < 1000000) return;
+    last_log_us = now_us;
+
+    const char *clock = (s_cfg.utc_enable && s_utc_ok) ? "UTC" : "本地";
+    const char *who = ((slot & 1) == (s_cfg.tx_slot_parity & 1)) ? "本台时隙" : "对端时隙";
+    if (s_tx_busy) {
+        ESP_LOGI(T, "[now] t=%lld.%03ds 时隙#%lld(%s) TX=发射中 RX=%d/%d块 已解%u(%u时隙) 时钟%s",
+                 (long long)(now_us / 1000000), (int)((now_us / 1000) % 1000),
+                 (long long)slot, who,
+                 mon->wf.num_blocks, mon->wf.max_blocks,
+                 (unsigned)s_stat_decoded, (unsigned)s_stat_slots, clock);
+    } else {
+        int64_t remain = (s_tx_next_us > now_us) ? (s_tx_next_us - now_us) / 1000 : 0;
+        ESP_LOGI(T, "[now] t=%lld.%03ds 时隙#%lld(%s) TX=待机(下次%lldms) RX=%d/%d块 已解%u(%u时隙) 时钟%s",
+                 (long long)(now_us / 1000000), (int)((now_us / 1000) % 1000),
+                 (long long)slot, who, (long long)remain,
+                 mon->wf.num_blocks, mon->wf.max_blocks,
+                 (unsigned)s_stat_decoded, (unsigned)s_stat_slots, clock);
+    }
+}
+
 static void ft8_rx_task(void *arg)
 {
     (void)arg;
@@ -437,11 +474,12 @@ static void ft8_rx_task(void *arg)
     const bool ft4 = app_is_ft4();
     const int sym_samples = app_sym_samples();
     const int64_t slot_us = app_slot_us();
+    const int64_t block_us = (int64_t)sym_samples * 1000000LL / FT8_AUDIO_RATE;
 
     static int16_t ablk[MAX_SYMBOL_SAMPLES * 2];
     static float   fr[MAX_SYMBOL_SAMPLES];
 
-    monitor_t mon;
+    monitor_t mon = { 0 };
     if (s_cfg.rx_enable) {
         monitor_config_t mc = {
             .f_min = s_cfg.rx_f_min,
@@ -456,62 +494,65 @@ static void ft8_rx_task(void *arg)
                  ft4 ? "FT4" : "FT8", mon.wf.num_bins, mon.wf.max_blocks);
     }
 
-    int64_t last_slot = -1;
-    int64_t last_log_us = -1;
+    /* 时隙节奏：
+     *  - 每个时隙从“时隙起点”开始接收(喂瀑布)；
+     *  - 到“时隙结束前 parse_us”即停止接收，在末尾静默段解析本时隙，
+     *    解析不占用下一时隙开头的采集窗口，窗口起点永远紧贴时隙边界。 */
+    const int64_t msg_us = (int64_t)app_nsym() * sym_samples * 1000000LL / FT8_AUDIO_RATE;
+    int64_t parse_us = (int64_t)(s_cfg.rx_parse_ms > 0 ? s_cfg.rx_parse_ms : 1500) * 1000;
+    if (parse_us < block_us) parse_us = block_us;      /* 至少一块，避免越到下一时隙 */
+    const int64_t margin_us = 500000;                  /* 对端起播/本机发射延时容差 */
+    int64_t cap_us = slot_us - parse_us;               /* 每时隙采集时长 */
+    if (cap_us < msg_us + margin_us) {
+        cap_us = msg_us + margin_us;                   /* 至少覆盖一整条消息 */
+        parse_us = slot_us - cap_us;
+    }
+    ESP_LOGI(T, "%s RX 节奏: 每时隙前%.2fs接收, 末尾预留%.2fs解析",
+             ft4 ? "FT4" : "FT8", (double)cap_us / 1e6, (double)parse_us / 1e6);
 
     for (;;) {
-        /* 读一拍(全双工 RX，不因时隙/发射暂停) */
-        int bytes = sym_samples * 4;
-        int got = 0;
-        while (got < bytes) {
-            size_t rd = 0;
-            if (wm8978_i2s_read((uint8_t *)ablk + got, bytes - got, &rd, 1000) != ESP_OK || rd == 0) {
-                vTaskDelay(pdMS_TO_TICKS(5));
-                continue;
-            }
-            got += (int)rd;
-        }
-        /* 时隙边界处理放在“喂瀑布之前”：
-         * 用本块读完后时刻判断归属，一旦跨入新时隙，先把上一时隙整窗解码并
-         * reset，再把本块作为新时隙窗口的第 1 块。这样窗口起点只会落在槽边界
-         * 之前(最多早 1 块)，绝不会丢掉槽边界之后消息开头的那几个符号——
-         * 否则紧贴时隙起点发射(如本机自收)会因首块丢失而时好时坏解不出。 */
-        int64_t now_us = esp_timer_get_time();
-        int64_t slot = now_us / slot_us;
-        if (slot != last_slot) {
-            int64_t prev_slot = last_slot;
-            last_slot = slot;
-            if (s_cfg.rx_enable && prev_slot >= 0) rx_decode_slot(&mon, prev_slot);
+        /* 对齐到下一个时隙起点(期间读并丢弃旧音频，保持 DMA 不积压) */
+        int64_t now = esp_timer_get_time();
+        int64_t boundary = (now / slot_us + 1) * slot_us;
+        while (esp_timer_get_time() < boundary) {
+            rx_discard_chunk();
+            rx_status_log(&mon, esp_timer_get_time(), boundary / slot_us - 1);
+            vTaskDelay(pdMS_TO_TICKS(2));
         }
 
-        if (s_cfg.rx_enable) {
-            for (int i = 0; i < sym_samples; i++) fr[i] = (float)ablk[i * 2] * (1.0f / 32768.0f);
-            monitor_process(&mon, fr);
+        const int64_t slot_id = boundary / slot_us;
+        const int64_t cap_end = boundary + cap_us;
+
+        /* 接收段：从时隙起点连续采集喂瀑布，直到 cap_end(时隙结束前 parse_us) */
+        now = esp_timer_get_time();
+        while (now < cap_end) {
+            int bytes = sym_samples * 4;
+            int got = 0;
+            while (got < bytes) {
+                size_t rd = 0;
+                if (wm8978_i2s_read((uint8_t *)ablk + got, bytes - got, &rd, 1000) != ESP_OK || rd == 0) {
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                    continue;
+                }
+                got += (int)rd;
+            }
+            if (s_cfg.rx_enable) {
+                for (int i = 0; i < sym_samples; i++) fr[i] = (float)ablk[i * 2] * (1.0f / 32768.0f);
+                monitor_process(&mon, fr);
+            }
+            now = esp_timer_get_time();
+            rx_status_log(&mon, now, slot_id);
         }
 
-        /* 每1000ms状态 */
-        if (now_us - last_log_us >= 1000000)
-        {
-            last_log_us = now_us;
-            const char *clock = (s_cfg.utc_enable && s_utc_ok) ? "UTC" : "本地";
-            const char *who = ((slot & 1) == (s_cfg.tx_slot_parity & 1)) ? "本台时隙" : "对端时隙";
-            if (s_tx_busy)
-            {
-                ESP_LOGI(T, "[now] t=%lld.%03ds 时隙#%lld(%s) TX=发射中 RX=%d/%d块 已解%u(%u时隙) 时钟%s",
-                         (long long)(now_us / 1000000), (int)((now_us / 1000) % 1000),
-                         (long long)slot, who,
-                         mon.wf.num_blocks, mon.wf.max_blocks,
-                         (unsigned)s_stat_decoded, (unsigned)s_stat_slots, clock);
-            }
-            else
-            {
-                int64_t remain = (s_tx_next_us > now_us) ? (s_tx_next_us - now_us) / 1000 : 0;
-                ESP_LOGI(T, "[now] t=%lld.%03ds 时隙#%lld(%s) TX=待机(下次%lldms) RX=%d/%d块 已解%u(%u时隙) 时钟%s",
-                         (long long)(now_us / 1000000), (int)((now_us / 1000) % 1000),
-                         (long long)slot, who, (long long)remain,
-                         mon.wf.num_blocks, mon.wf.max_blocks,
-                         (unsigned)s_stat_decoded, (unsigned)s_stat_slots, clock);
-            }
+        /* 停止接收：在时隙末尾静默段解析本时隙(之后自动等到下一时隙起点) */
+        rx_status_log(&mon, esp_timer_get_time(), slot_id);
+        if (s_cfg.rx_enable) rx_decode_slot(&mon, slot_id);
+
+        int64_t after = esp_timer_get_time();
+        int64_t next_b = (slot_id + 1) * slot_us;
+        if (after > next_b) {
+            ESP_LOGW(T, "解析耗时超时隙尾部%lldms，可能错过时隙 #%lld 开头",
+                     (long long)((after - next_b) / 1000), (long long)(slot_id + 1));
         }
     }
 }

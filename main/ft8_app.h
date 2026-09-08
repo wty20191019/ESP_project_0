@@ -108,6 +108,8 @@ typedef struct {
     int rx_freq_osr;            /*!< 频率细分(≥1) */
     int max_candidates;         /*!< 每时隙候选数 */
     int ldpc_iterations;        /*!< LDPC 最大迭代次数 */
+    uint32_t rx_parse_ms;       /*!< 每个时隙结束前提前多少 ms 停止接收并开始解析
+                                 *    (解析时间预算，默认 1500)；应小于时隙静默段时长 */
 
     uint8_t _reserved[8];
 } ft8_app_config_t;

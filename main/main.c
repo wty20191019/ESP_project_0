@@ -340,22 +340,23 @@ void app_main(void)
     static ft8_app_config_t cfg;    /* 必须保持有效：ft8_app 以引用方式使用它，运行中可直接改 */
     ft8_app_config_default(&cfg);
 
-    cfg.protocol      = FTX_PROTOCOL_FT8;                   /* FTX_PROTOCOL_FT4 切到 FT4(7.5s 时隙) */
-    cfg.tx_enable     = true;                               /* 参与发射(仅在选中奇偶时隙) */
-    cfg.rx_enable     = true;                               /* 持续解码 */
-    cfg.utc_enable    = true;                               /* 时隙对齐 UTC(:00/:15/:30/:45)，需先 SNTP 校时 */
-    cfg.tx_slot_parity = 0;                                 /* 0=偶时隙发 / 1=奇时隙发，自动与对端交替 */
-    cfg.tx_delay_ms   = 0;                                /* 本台时隙内再延时发射 */
+    cfg.protocol            = FTX_PROTOCOL_FT8;             /* FTX_PROTOCOL_FT4 切到 FT4(7.5s 时隙) */
+    cfg.tx_enable           = true;                         /* 参与发射(仅在选中奇偶时隙) */
+    cfg.rx_enable           = true;                         /* 持续解码 */
+    cfg.utc_enable          = true;                         /* 时隙对齐 UTC(:00/:15/:30/:45)，需先 SNTP 校时 */
+    cfg.tx_slot_parity      = 0;                            /* 0=偶时隙发 / 1=奇时隙发，自动与对端交替 */
+    cfg.tx_delay_ms         = 500;                          /* 本台时隙内再延时发射 */
+    cfg.rx_parse_ms         = 400;                          /* 每个时隙结束前静默期(ms)，用于整窗解析 */    
     snprintf(cfg.callsign, sizeof(cfg.callsign), "BG7ZJW"); // 本机呼号
     snprintf(cfg.grid,     sizeof(cfg.grid),     "JO70");   // 本机网格
-    cfg.tx.type           = FT8_APP_MSG_CQ;                 /* 第几类消息: CQ / CALL / REPORT / R_REPORT / RRR / RR73 / 73 */
-    cfg.tx.cq_modifier[0] = '\0';                           /* "DX"/"WW"/"TEST"... 仅 CQ 类用 */
-    cfg.tx.call_to[0]     = '\0';                           /* 目标呼号(类型 2~6 用)，如 "BG5ABC" */
-    cfg.tx.rst_db         = -12;                            /* 信号报告 dB(类型 3/4 用)：REPORT 发 -12，R_REPORT 发 R-12 */
-    cfg.audio_freq_hz = 1500.0f;                            /* 音频中心(8-GFSK tone0) */
-    cfg.audio_level   = 0.80f;                              /* 发射电平 */ /*!< 发射幅度 0~1，防削波建议 ≤0.9 */
-    cfg.rx_f_max      = 3000.0f;                            /* 解码频率上限 */
-    cfg.rx_f_min      = 50.0f;                              /* 解码频率下限 */
+    cfg.tx.type             = FT8_APP_MSG_CQ;               /* 第几类消息: CQ / CALL / REPORT / R_REPORT / RRR / RR73 / 73 */
+    cfg.tx.cq_modifier[0]   = '\0';                         /* "DX"/"WW"/"TEST"... 仅 CQ 类用 */
+    cfg.tx.call_to[0]       = '\0';                         /* 目标呼号(类型 2~6 用)，如 "BG5ABC" */
+    cfg.tx.rst_db           = -12;                          /* 信号报告 dB(类型 3/4 用)：REPORT 发 -12，R_REPORT 发 R-12 */
+    cfg.audio_freq_hz       = 1500.0f;                      /* 音频中心(8-GFSK tone0) */
+    cfg.audio_level         = 0.80f;                        /* 发射电平 */ /*!< 发射幅度 0~1，防削波建议 ≤0.9 */
+    cfg.rx_f_max            = 3000.0f;                      /* 解码频率上限 */
+    cfg.rx_f_min            = 50.0f;                        /* 解码频率下限 */
 
     /* WM8978 编解码器参数(对应原硬编码的 ADDA(1,1)/Input(1,1,0)/MIC40/Output(1,0)/I2S(2,0)/HP(50,50)/SPK40，
      * 默认已一致，这里仅示例按需修改) */
