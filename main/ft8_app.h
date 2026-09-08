@@ -56,6 +56,23 @@ typedef struct {
                                  *    特殊值冲突)，超出会被截断并告警 */
 } ft8_app_tx_msg_t;
 
+/** WM8978 编解码器初始化参数(仅 ft8_app_start 启动时应用一次) */
+typedef struct {
+    uint8_t dac_en;      /*!< DAC 通路使能 1/0，WM8978_ADDA_Cfg(dac_en, adc_en) */
+    uint8_t adc_en;      /*!< ADC 通路使能 1/0 */
+    uint8_t mic_en;      /*!< MIC 输入使能 1/0，WM8978_Input_Cfg(mic_en, linein_en, aux_en) */
+    uint8_t linein_en;   /*!< Line In 输入使能 1/0 */
+    uint8_t aux_en;      /*!< AUX 输入使能 1/0 */
+    uint8_t mic_gain;    /*!< MIC 增益 0~63(-12~+35.25dB，0.75dB/步) */
+    uint8_t out_dac;     /*!< DAC 输出使能(功放前级) 1/0，WM8978_Output_Cfg(out_dac, out_bypass) */
+    uint8_t out_bypass;  /*!< Bypass 直通输出使能 1/0 */
+    uint8_t i2s_fmt;     /*!< I2S 格式 0~3(2=飞利浦标准 I2S)，WM8978_I2S_Cfg(i2s_fmt, i2s_len) */
+    uint8_t i2s_len;     /*!< I2S 位宽 0~3(0=16bit) */
+    uint8_t hp_vol_l;    /*!< 耳机左声道音量 0~63(0 静音)，WM8978_HPvol_Set(l, r) */
+    uint8_t hp_vol_r;    /*!< 耳机右声道音量 0~63(0 静音) */
+    uint8_t spk_vol;     /*!< 喇叭音量 0~63(0 静音)，WM8978_SPKvol_Set */
+} ft8_app_codec_cfg_t;
+
 /** FT8/FT4 应用配置结构体 */
 typedef struct {
     /* ---- 协议与开关 ---- */
@@ -74,8 +91,11 @@ typedef struct {
     char callsign[16];          /*!< 本机呼号，如 "BG7ABC" */
     char grid[8];               /*!< 本机网格，如 "JO70" */
 
-    /* ---- 消息内容(可运行中热切换，见 ft8_app_tx_msg_set) ---- */
+    /* ---- 消息内容(TX 任务每时隙前重新读取；运行中直接改 cfg.tx.* 即可热切换) ---- */
     ft8_app_tx_msg_t tx;
+
+    /* ---- WM8978 编解码器初始化(仅启动时使用，运行中不建议改) ---- */
+    ft8_app_codec_cfg_t codec;
 
     /* ---- 音频(发射，微观层) ---- */
     float audio_freq_hz;        /*!< tone0 中心频率 Hz(常用 1200/1500)，8-GFSK 高斯成形 */
@@ -92,27 +112,23 @@ typedef struct {
     uint8_t _reserved[8];
 } ft8_app_config_t;
 
-/** 填充默认配置(FT8 / BG7ABC / JO70 / 纯 CQ / UTC 偶时隙 / 0 延时) */
+/** 填充默认配置(FT8 / BG7ABC / JO70 / 纯 CQ / UTC 偶时隙 / 0 延时 / WM8978 常用参数) */
 void ft8_app_config_default(ft8_app_config_t *cfg);
 
 /**
- * @brief 运行中热切换 TX 发射消息(线程安全)
+ * @brief 启动 FT8/FT4 应用任务
  *
- * 在任一其它任务里修改 type/call_to/rst_db 等后调用，TX 任务会在下一个
- * 本台时隙前重新编码并生成波形，无需重启 FT8 应用。
- *
- * @param tx 新的消息参数(会被复制)
- */
-void ft8_app_tx_msg_set(const ft8_app_tx_msg_t *tx);
-
-/**
- * @brief 启动 FT8/FT4 应用任务(配置会被复制)
- *
- * 单任务内完成：I2S/WM8978 音频初始化 -> 逐符号采集喂瀑布 -> 每时隙解码一次；
+ * 单任务内完成：WM8978+I2S 音频初始化 -> 逐符号采集喂瀑布 -> 每时隙解码一次；
  * 同时在"本台奇偶时隙"内按 发射延时 播放预生成的 8-GFSK 波形(其余补零静默)。
  *
+ * @note 配置采用"引用"而非拷贝：模块会持续读取 cfg 中的消息内容(cfg.tx /
+ *       callsign / grid 等)来决定下一时隙发什么。因此 cfg 必须在整个运行期间
+ *       保持有效(建议定义为全局或 static 变量)；想切换发射消息时直接修改
+ *       cfg.tx.type / cfg.tx.call_to / cfg.tx.rst_db 即可，下一本台时隙生效。
+ *       其余如时隙/协议/音频等参数以启动时刻为准。
+ *
  * @note 只应调用一次；重复调用将被忽略并返回 ESP_OK
- * @param cfg 配置(会被复制，可在栈上使用)
+ * @param cfg 配置(不会被复制，需保持有效)
  * @return ESP_OK 成功
  */
 esp_err_t ft8_app_start(const ft8_app_config_t *cfg);

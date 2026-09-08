@@ -44,20 +44,32 @@
 
 static const char *TAG = "ft8_app";
 
-static ft8_app_config_t s_cfg;
+/* 配置为“引用”而非拷贝：ft8_app_start 只保存用户传入 cfg 的指针，任务持续
+ * 读取它。运行中想换发射消息时，直接改 cfg.tx.type / call_to / rst_db 即可，
+ * TX 任务下一个本台时隙前会自动重建波形，无需专用接口。 */
+static ft8_app_config_t *s_cfg_p = NULL;
+#define s_cfg (*s_cfg_p)
+
 static bool s_utc_ok = false;
 
 /* TX 运行状态(供 RX 每秒日志读取) */
 static volatile bool s_tx_busy = false;
 static volatile int64_t s_tx_next_us = 0;
 
-/* TX 消息热切换与波形缓存 */
-static portMUX_TYPE s_tx_mux = portMUX_INITIALIZER_UNLOCKED;
+/* TX 波形缓存：波形由“影响消息内容/波形的配置字段”决定，字段变了才重建 */
+typedef struct {
+    ft8_app_tx_msg_t tx;        /*!< 消息类型与参数(第几类消息+相关参数) */
+    char callsign[16];          /*!< 本机呼号(消息文本用到) */
+    char grid[8];               /*!< 本机网格 */
+    float audio_freq_hz;        /*!< 波形载波 */
+    float audio_level;          /*!< 波形幅度 */
+} tx_wave_key_t;
+
 static int16_t *s_wave = NULL;           /* 当前待播波形(PSRAM)，每个本台时隙播放 */
 static size_t  s_wave_samples = 0;
 static bool    s_wave_valid = false;     /* 有可用波形(可能沿用上一帧旧消息) */
-static ft8_app_tx_msg_t s_wave_cfg;      /* 当前波形对应的消息参数 */
-static ft8_app_tx_msg_t s_last_err_cfg;  /* 最近一次编码失败的消息(用于去重告警) */
+static tx_wave_key_t s_wave_key;         /* 当前波形对应的配置字段快照 */
+static tx_wave_key_t s_last_err_key;     /* 最近一次编码失败的快照(用于去重告警) */
 
 /* 运行统计 */
 static uint32_t s_stat_slots = 0;
@@ -75,22 +87,20 @@ static int64_t app_slot_us(void)         { return app_is_ft4() ? (int64_t)750000
  * ============================================================ */
 static uint8_t s_tones[FT4_NN];
 
-/* 两个消息参数是否一致(用于判断波形是否需要重建) */
-static bool tx_msg_eq(const ft8_app_tx_msg_t *a, const ft8_app_tx_msg_t *b)
+/* 读取“当前应发射内容”对应的配置字段快照(用户直接改 cfg 即反映到这里) */
+static void tx_key_get(tx_wave_key_t *k)
 {
-    return a->type == b->type && a->rst_db == b->rst_db &&
-           strcmp(a->call_to, b->call_to) == 0 &&
-           strcmp(a->cq_modifier, b->cq_modifier) == 0;
+    k->tx = s_cfg.tx;
+    memcpy(k->callsign, s_cfg.callsign, sizeof(k->callsign));
+    memcpy(k->grid,     s_cfg.grid,     sizeof(k->grid));
+    k->audio_freq_hz = s_cfg.audio_freq_hz;
+    k->audio_level   = s_cfg.audio_level;
 }
 
-/* 原子读取当前 TX 消息参数(运行中可被 ft8_app_tx_msg_set 改写) */
-static ft8_app_tx_msg_t tx_msg_get(void)
+/* 两个快照是否一致(决定波形是否需要重建)；整块比较，避免未清零字符串越界 */
+static bool tx_key_eq(const tx_wave_key_t *a, const tx_wave_key_t *b)
 {
-    ft8_app_tx_msg_t tx;
-    portENTER_CRITICAL(&s_tx_mux);
-    tx = s_cfg.tx;
-    portEXIT_CRITICAL(&s_tx_mux);
-    return tx;
+    return memcmp(a, b, sizeof(*a)) == 0;
 }
 
 /* FT8 信号报告文本：±两位(如 -12 / +05)，R 报告加 "R" 前缀。
@@ -244,25 +254,26 @@ static int16_t *tx_build_wave(int nsym, int sym_samples, size_t *out_samples)
 }
 
 /* ============================================================
- * TX 波形刷新：消息参数(s_cfg.tx)在运行时被改过则重新编码并重建波形。
- * 只在时隙之间的空闲期执行(时间充裕)。编码失败时保留上一帧有效波形继续
- * 发射，避免出现"静默空拍"；返回 true = 有可用波形。
+ * TX 波形刷新：直接改的 cfg 影响发射内容时(消息类型/参数/呼号/网格/电平…)
+ * 则重新编码并重建波形。只在时隙之间的空闲期执行(时间充裕)。编码失败时
+ * 保留上一帧有效波形继续发射，避免出现"静默空拍"；返回 true = 有可用波形。
  * ============================================================ */
 static bool tx_wave_refresh(void)
 {
-    ft8_app_tx_msg_t tx = tx_msg_get();
+    tx_wave_key_t key;
+    tx_key_get(&key);
 
-    /* 与当前波形对应参数一致 -> 无需重建 */
-    if (s_wave_valid && tx_msg_eq(&tx, &s_wave_cfg)) return true;
+    /* 与当前波形对应的配置一致 -> 无需重建 */
+    if (s_wave_valid && tx_key_eq(&key, &s_wave_key)) return true;
 
-    if (tx_encode_message(&tx) != ESP_OK) {
-        if (!s_wave_valid || !tx_msg_eq(&tx, &s_last_err_cfg)) {
+    if (tx_encode_message(&key.tx) != ESP_OK) {
+        if (!s_wave_valid || !tx_key_eq(&key, &s_last_err_key)) {
             ESP_LOGE(TAG, "TX 消息编码失败，%s",
                      s_wave_valid ? "沿用上一帧有效波形" : "无可用波形，TX 停发");
-            s_last_err_cfg = tx;
+            s_last_err_key = key;
         }
         if (s_wave_valid) {
-            s_wave_cfg = tx;   /* 已尝试过本次配置，避免每轮循环重复尝试刷屏 */
+            s_wave_key = key;   /* 已尝试过本次配置，避免每轮循环重复尝试刷屏 */
             return true;
         }
         return false;
@@ -273,7 +284,7 @@ static bool tx_wave_refresh(void)
     if (w == NULL) {
         ESP_LOGE(TAG, "发射波形内存不足");
         if (s_wave_valid) {
-            s_wave_cfg = tx;   /* 同上：已尝试过，沿用旧波形 */
+            s_wave_key = key;   /* 同上：已尝试过，沿用旧波形 */
             return true;
         }
         return false;
@@ -281,7 +292,7 @@ static bool tx_wave_refresh(void)
     free(s_wave);
     s_wave = w;
     s_wave_samples = n;
-    s_wave_cfg = tx;
+    s_wave_key = key;
     s_wave_valid = true;
     return true;
 }
@@ -504,15 +515,16 @@ static void ft8_tx_task(void *arg)
         s_tx_next_us = target;
 
         /* 先长睡到临近，再忙等到目标时刻，保证起播误差 <1ms。
-         * 睡眠期间若发现消息参数又被改过(热切换)，放弃本目标回外层重建，
-         * 确保"运行中切换，下一本台时隙生效"不失约 */
+         * 睡眠期间若发现 cfg 又被直接改过(热切换)，放弃本目标回外层重建，
+         * 确保"运行中改配置，下一本台时隙生效"不失约 */
         int64_t t = esp_timer_get_time();
         bool stale = false;
         while (t < target - 30000) {
             vTaskDelay(pdMS_TO_TICKS(5));
             t = esp_timer_get_time();
-            ft8_app_tx_msg_t cur = tx_msg_get();
-            if (!tx_msg_eq(&cur, &s_wave_cfg)) {
+            tx_wave_key_t cur;
+            tx_key_get(&cur);
+            if (!tx_key_eq(&cur, &s_wave_key)) {
                 stale = true;
                 break;
             }
@@ -591,6 +603,22 @@ void ft8_app_config_default(ft8_app_config_t *cfg)
     snprintf(cfg->grid,     sizeof(cfg->grid),     "JO70");
     cfg->tx.type           = FT8_APP_MSG_CQ;
     cfg->tx.rst_db         = -12;   /* 仅 REPORT / R_REPORT 用，默认给个常用值 */
+
+    /* WM8978 初始化参数(对应原硬编码：ADDA(1,1) Input(1,1,0) MIC40 Out(1,0) I2S(2,0) HP(50,50) SPK40) */
+    cfg->codec.dac_en     = 1;
+    cfg->codec.adc_en     = 1;
+    cfg->codec.mic_en     = 1;
+    cfg->codec.linein_en  = 1;
+    cfg->codec.aux_en     = 0;
+    cfg->codec.mic_gain   = 40;
+    cfg->codec.out_dac    = 1;
+    cfg->codec.out_bypass = 0;
+    cfg->codec.i2s_fmt    = 2;
+    cfg->codec.i2s_len    = 0;
+    cfg->codec.hp_vol_l   = 50;
+    cfg->codec.hp_vol_r   = 50;
+    cfg->codec.spk_vol    = 40;
+
     cfg->audio_freq_hz     = 1200.0f;
     cfg->audio_level      = 0.45f;
     cfg->rx_f_min         = 0.0f;
@@ -599,19 +627,6 @@ void ft8_app_config_default(ft8_app_config_t *cfg)
     cfg->rx_freq_osr      = 2;
     cfg->max_candidates   = 140;
     cfg->ldpc_iterations  = 25;
-}
-
-void ft8_app_tx_msg_set(const ft8_app_tx_msg_t *tx)
-{
-    if (tx == NULL) return;
-    ft8_app_tx_msg_t n = *tx;
-    n.call_to[sizeof(n.call_to) - 1] = '\0';     /* 防止未清零结构导致越界读 */
-    n.cq_modifier[sizeof(n.cq_modifier) - 1] = '\0';
-    portENTER_CRITICAL(&s_tx_mux);
-    s_cfg.tx = n;
-    portEXIT_CRITICAL(&s_tx_mux);
-    ESP_LOGI(TAG, "TX 消息热切换: 类型=%d 目标=%s rst_db=%d(下一本台时隙生效)",
-             (int)n.type, n.call_to, n.rst_db);
 }
 
 esp_err_t ft8_app_start(const ft8_app_config_t *cfg)
@@ -623,20 +638,20 @@ esp_err_t ft8_app_start(const ft8_app_config_t *cfg)
         ESP_LOGW(TAG, "FT8 应用已在运行，忽略本次启动");
         return ESP_OK;
     }
-    s_cfg = *cfg;
+    s_cfg_p = (ft8_app_config_t *)cfg;   /* 引用而非拷贝：运行中直接改 cfg 即生效 */
 
     vTaskDelay(pdMS_TO_TICKS(200));
     if (WM8978_Init() != 0) {
         ESP_LOGE(TAG, "WM8978 初始化失败");
         return ESP_FAIL;
     }
-    WM8978_ADDA_Cfg(1, 1);
-    WM8978_Input_Cfg(1, 1, 0);
-    WM8978_MIC_Gain(40);
-    WM8978_Output_Cfg(1, 0);
-    WM8978_I2S_Cfg(2, 0);
-    WM8978_HPvol_Set(50, 50);
-    WM8978_SPKvol_Set(40);
+    WM8978_ADDA_Cfg(s_cfg.codec.dac_en, s_cfg.codec.adc_en);
+    WM8978_Input_Cfg(s_cfg.codec.mic_en, s_cfg.codec.linein_en, s_cfg.codec.aux_en);
+    WM8978_MIC_Gain(s_cfg.codec.mic_gain);
+    WM8978_Output_Cfg(s_cfg.codec.out_dac, s_cfg.codec.out_bypass);
+    WM8978_I2S_Cfg(s_cfg.codec.i2s_fmt, s_cfg.codec.i2s_len);
+    WM8978_HPvol_Set(s_cfg.codec.hp_vol_l, s_cfg.codec.hp_vol_r);
+    WM8978_SPKvol_Set(s_cfg.codec.spk_vol);
     ESP_ERROR_CHECK(wm8978_i2s_init(FT8_AUDIO_RATE));
     ESP_ERROR_CHECK(wm8978_i2s_start_rx());
     ESP_ERROR_CHECK(wm8978_i2s_start_tx());
