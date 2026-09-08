@@ -730,7 +730,7 @@ void ft8_app_config_default(ft8_app_config_t *cfg)
     cfg->rx_f_max         = 4000.0f;
     cfg->rx_time_osr      = 2;
     cfg->rx_freq_osr      = 2;
-    cfg->max_candidates   = 140;
+    cfg->max_candidates   = 60;  /*每时隙解码耗时 ≈ 候选数(max_candidates) × 每个候选迭代数(ldpc_iterations) × 单次迭代成本*/
     cfg->ldpc_iterations  = 25;
 }
 

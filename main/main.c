@@ -346,7 +346,7 @@ void app_main(void)
     cfg.utc_enable          = true;                         /* 时隙对齐 UTC(:00/:15/:30/:45)，需先 SNTP 校时 */
     cfg.tx_slot_parity      = 0;                            /* 0=偶时隙发 / 1=奇时隙发，自动与对端交替 */
     cfg.tx_delay_ms         = 500;                          /* 本台时隙内再延时发射 */
-    cfg.rx_parse_ms         = 400;                          /* 每个时隙结束前静默期(ms)，用于整窗解析 */    
+    cfg.rx_parse_ms         = 10;                           /* 每个时隙结束前静默期(ms)，用于整窗解析 */    
     snprintf(cfg.callsign, sizeof(cfg.callsign), "BG7ZJW"); // 本机呼号
     snprintf(cfg.grid,     sizeof(cfg.grid),     "JO70");   // 本机网格
     cfg.tx.type             = FT8_APP_MSG_CQ;               /* 第几类消息: CQ / CALL / REPORT / R_REPORT / RRR / RR73 / 73 */
