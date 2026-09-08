@@ -108,7 +108,8 @@ typedef struct {
     int rx_freq_osr;            /*!< 频率细分(≥1) */
     int max_candidates;         /*!< 每时隙候选数  每个时隙最多挑出多少个“候选信号” */
     int ldpc_iterations;        /*!< LDPC 最大迭代次数 把瀑布幅度转成软比特，再用置信传播迭代解码 越多：纠错越强，弱/被干扰的信号越可能解出来，但每个候选的耗时近似成正比；越少：快但容易解不出弱台。 */
-    uint32_t rx_parse_ms;       /*!< 每个时隙结束前提前多少 ms 停止接收并开始解析  应小于时隙静默段时长 */
+    uint32_t rx_parse_ms;       /*!< 每个时隙结束前提前多少 ms 停止接收并开始解析
+                                 *    (下限 1500ms，默认 1500；过小会被钳到 1.5s 以免解码拖入下一时隙) */
 
     uint8_t _reserved[8];
 } ft8_app_config_t;

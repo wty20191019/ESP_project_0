@@ -346,7 +346,7 @@ void app_main(void)
     cfg.utc_enable          = true;                         /* 时隙对齐 UTC(:00/:15/:30/:45)，需先 SNTP 校时 */
     cfg.tx_slot_parity      = 0;                            /* 0=偶时隙发 / 1=奇时隙发，自动与对端交替 */
     cfg.tx_delay_ms         = 500;                          /* 本台时隙内再延时发射 */
-    cfg.rx_parse_ms         = 10;                           /* 每个时隙结束前静默期(ms)，用于整窗解析 */    
+    cfg.rx_parse_ms         = 100;                          /* 每个时隙结束前静默期(ms)，用于整窗解析 */    
     snprintf(cfg.callsign, sizeof(cfg.callsign), "BG7ZJW"); // 本机呼号
     snprintf(cfg.grid,     sizeof(cfg.grid),     "JO70");   // 本机网格
     cfg.tx.type             = FT8_APP_MSG_CQ;               /* 第几类消息: CQ / CALL / REPORT / R_REPORT / RRR / RR73 / 73 */
@@ -357,6 +357,8 @@ void app_main(void)
     cfg.audio_level         = 0.80f;                        /* 发射电平 */ /*!< 发射幅度 0~1，防削波建议 ≤0.9 */
     cfg.rx_f_max            = 3000.0f;                      /* 解码频率上限 */
     cfg.rx_f_min            = 50.0f;                        /* 解码频率下限 */
+    cfg.max_candidates      = 50;                           /*每时隙解码耗时 ≈ 候选数(max_candidates) × 每个候选迭代数(ldpc_iterations) × 单次迭代成本*/
+    cfg.ldpc_iterations     = 25;
 
     /* WM8978 编解码器参数(对应原硬编码的 ADDA(1,1)/Input(1,1,0)/MIC40/Output(1,0)/I2S(2,0)/HP(50,50)/SPK40，
      * 默认已一致，这里仅示例按需修改) */
