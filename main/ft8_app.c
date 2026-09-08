@@ -479,24 +479,29 @@ static void ft8_rx_task(void *arg)
         /* 时隙边界：上一时隙收齐 -> 解析 */
         int64_t now_us = esp_timer_get_time();
         int64_t slot = now_us / slot_us;
-        if (slot != last_slot) {
+        if (slot != last_slot)
+        {
             int64_t prev_slot = last_slot;
             last_slot = slot;
             if (s_cfg.rx_enable) rx_decode_slot(&mon, prev_slot);
         }
 
         /* 每1000ms状态 */
-        if (now_us - last_log_us >= 1000000) {
+        if (now_us - last_log_us >= 1000000)
+        {
             last_log_us = now_us;
             const char *clock = (s_cfg.utc_enable && s_utc_ok) ? "UTC" : "本地";
             const char *who = ((slot & 1) == (s_cfg.tx_slot_parity & 1)) ? "本台时隙" : "对端时隙";
-            if (s_tx_busy) {
+            if (s_tx_busy)
+            {
                 ESP_LOGI(T, "[now] t=%lld.%03ds 时隙#%lld(%s) TX=发射中 RX=%d/%d块 已解%u(%u时隙) 时钟%s",
                          (long long)(now_us / 1000000), (int)((now_us / 1000) % 1000),
                          (long long)slot, who,
                          mon.wf.num_blocks, mon.wf.max_blocks,
                          (unsigned)s_stat_decoded, (unsigned)s_stat_slots, clock);
-            } else {
+            }
+            else
+            {
                 int64_t remain = (s_tx_next_us > now_us) ? (s_tx_next_us - now_us) / 1000 : 0;
                 ESP_LOGI(T, "[now] t=%lld.%03ds 时隙#%lld(%s) TX=待机(下次%lldms) RX=%d/%d块 已解%u(%u时隙) 时钟%s",
                          (long long)(now_us / 1000000), (int)((now_us / 1000) % 1000),
