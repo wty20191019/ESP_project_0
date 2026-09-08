@@ -29,10 +29,9 @@
  *  两个任务各自操作 I2S0 的 TX/RX 方向(全双工)，互不阻塞。
  *  波形：GFSK 高斯成形(官方 gen_ft8 算法)，PSRAM 预生成。
  *
- *  ⚠ 时隙栅格：默认以 esp_timer(上电时刻) 为 0 的本地栅格做严格
- *    对齐；若需真正对齐 UTC(:00/:15/:30/:45)，需先接入 SNTP 且提供
- *    毫秒级墙钟(当前 time() 只有秒级，无法把 esp_timer 相位映射到
- *    UTC 亚秒，只会保证奇偶相位正确)。启用 utc_enable 仅用于校验。
+ *  ⚠ 时隙栅格：utc_enable+gps_utc_enable 且 GPS UTC+PPS 就绪时，用 GPS 把
+ *    esp_timer 相位映射到 UTC，按 UTC(:00/:15/:30/:45) 栅格收发；GPS 未
+ *    就绪时回退到以 esp_timer(上电时刻)为 0 的本地栅格(仅用于无网测试)。
  * ============================================================ */
 
 #define FT8_AUDIO_RATE      12000
@@ -81,6 +80,148 @@ static bool app_is_ft4(void)             { return s_cfg.protocol == FTX_PROTOCOL
 static int  app_sym_samples(void)        { return app_is_ft4() ? 576 : 1920; }
 static int  app_nsym(void)               { return app_is_ft4() ? FT4_NN : FT8_NN; }
 static int64_t app_slot_us(void)         { return app_is_ft4() ? (int64_t)7500000 : (int64_t)15000000; }
+
+/* ============================================================
+ * UTC 栅格映射：esp_timer ↔ GPS UTC
+ * 用 GPS 的 PPS 上升沿(esp_timer 时刻)配合同一时刻的 UTC 时间，得到
+ * “esp_timer 时刻 ↔ UTC 秒”的固定相位关系，之后 RX/TX 都按 UTC 的
+ * 15s/7.5s 栅格(整分钟 :00/:15/:30/:45)计算时隙，实现真正 UTC 对齐。
+ * 校准只在 GPS UTC+PPS 首次有效时锁存一次(esp_timer 晶振漂移可忽略)。
+ * ============================================================ */
+static portMUX_TYPE s_utc_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool     s_utc_locked = false;      /* 已用 GPS 校准 UTC 相位 */
+static int64_t  s_utc_edge_us = 0;         /* 校准点：PPS 上升沿的 esp_timer µs */
+static int64_t  s_utc_edge_sec = 0;        /* 校准点：该沿对应的 UTC 秒(1970 起) */
+
+/* 儒略日(公历) -> 自 1970-01-01 的天数 */
+static int64_t utc_days_from_civil(int64_t y, int64_t m, int64_t d)
+{
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153u * (unsigned)(m + (m > 2 ? -3 : 9)) + 2) / 5u + (unsigned)d - 1u;
+    unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+static int64_t utc_to_epoch_s(const ft8_app_gps_time_t *g)
+{
+    int64_t days = utc_days_from_civil(g->year, g->month, g->day);
+    return days * 86400 + g->hour * 3600 + g->minute * 60 + g->second;
+}
+
+typedef struct {
+    bool    locked;
+    int64_t edge_us;
+    int64_t edge_sec;
+} utc_ref_t;
+
+static void utc_ref_get(utc_ref_t *r)
+{
+    portENTER_CRITICAL(&s_utc_mux);
+    r->locked    = s_utc_locked;
+    r->edge_us   = s_utc_edge_us;
+    r->edge_sec  = s_utc_edge_sec;
+    portEXIT_CRITICAL(&s_utc_mux);
+}
+
+/* esp_timer now_us -> UTC 微秒(自1970)；未锁定时原样返回(本地栅格) */
+static int64_t utc_to_us(const utc_ref_t *r, int64_t now_us)
+{
+    if (!r->locked) return now_us;
+    return r->edge_sec * 1000000LL + (now_us - r->edge_us);
+}
+
+/* UTC 微秒 -> esp_timer 微秒 */
+static int64_t utc_from_us(const utc_ref_t *r, int64_t utc_us)
+{
+    if (!r->locked) return utc_us;
+    return r->edge_us + (utc_us - r->edge_sec * 1000000LL);
+}
+
+static bool gps_cfg_eq(const ft8_app_gps_time_t *a, const ft8_app_gps_time_t *b)
+{
+    return a->valid == b->valid &&
+           a->year == b->year && a->month == b->month && a->day == b->day &&
+           a->hour == b->hour && a->minute == b->minute && a->second == b->second &&
+           a->millisecond == b->millisecond && a->pps_seq == b->pps_seq &&
+           a->pps_edge_us == b->pps_edge_us;
+}
+
+/* 稳定读取 cfg.gps(避免另一核写入时读到撕裂的 64 位字段) */
+static bool gps_cfg_get(ft8_app_gps_time_t *out)
+{
+    ft8_app_gps_time_t a, b;
+    for (int i = 0; i < 4; i++) {
+        a = s_cfg.gps;
+        b = s_cfg.gps;
+        if (gps_cfg_eq(&a, &b)) {
+            *out = a;
+            return a.valid;
+        }
+    }
+    return false;
+}
+
+/* 若启用 GPS UTC 且 GPS 时间已就绪，则锁存一次 UTC 相位。
+ *  - gps_use_pps=true：用 PPS 上升沿做亚秒精对齐；为排除“PPS 已进到下一秒而
+ *    NMEA 时间还没更新”的短暂错位，要求两次采样 pps_seq 与 UTC 秒同步前进。
+ *  - gps_use_pps=false：不用 PPS，把解析到该 UTC 秒的 esp_timer 时刻近似当作
+ *    该秒起点(NMEA 粗对齐，误差可达数百 ms~1s，仅适合无 PPS 场合)。 */
+static void utc_try_lock_gps(void)
+{
+    if (s_utc_locked) return;
+    if (!s_cfg.utc_enable || !s_cfg.gps_utc_enable) return;
+
+    const bool use_pps = s_cfg.gps_use_pps;
+
+    ft8_app_gps_time_t g;
+    if (!gps_cfg_get(&g) || !g.valid) return;
+    if (use_pps && g.pps_seq == 0) return;              /* 要求 PPS 但尚未收到 */
+
+    static uint32_t prev_seq = 0;
+    static uint8_t  prev_sec = 0;
+    static bool     have_prev = false;
+
+    if (use_pps) {
+        if (!have_prev) {
+            prev_seq = g.pps_seq;
+            prev_sec = g.second;
+            have_prev = true;
+            return;
+        }
+        uint32_t dseq = g.pps_seq - prev_seq;           /* PPS 前进步数 */
+        int dsec = (int)g.second - (int)prev_sec;
+        if (dsec < 0) dsec += 60;                       /* 跨分钟回绕 */
+        prev_seq = g.pps_seq;
+        prev_sec = g.second;
+        if (dseq < 1 || dsec != (int)dseq) return;      /* 时间与 PPS 未同步前进 */
+    }
+
+    int64_t sec = utc_to_epoch_s(&g);
+    if (sec < 946684800LL) return;                      /* 早于 2000-01-01 视为无效 */
+
+    /* PPS 精对齐：校准点取 PPS 上升沿；NMEA 粗对齐：校准点取“当前解析时刻” */
+    int64_t edge_us = use_pps ? g.pps_edge_us : esp_timer_get_time();
+    bool    locked_now = false;
+    portENTER_CRITICAL(&s_utc_mux);
+    if (!s_utc_locked) {
+        s_utc_locked    = true;
+        s_utc_edge_us   = edge_us;
+        s_utc_edge_sec  = sec;
+        s_utc_ok        = true;
+        locked_now      = true;
+    }
+    portEXIT_CRITICAL(&s_utc_mux);
+
+    if (locked_now) {
+        ESP_LOGI(TAG, "GPS UTC 相位已校准(%s): %04u-%02u-%02u %02u:%02u:%02u.%03u "
+                 "PPS#%lu edge=%lldus",
+                 use_pps ? "PPS" : "NMEA粗对齐",
+                 g.year, g.month, g.day, g.hour, g.minute, g.second, g.millisecond,
+                 (unsigned long)g.pps_seq, (long long)edge_us);
+    }
+}
 
 /* ============================================================
  * 发送消息：按 ft8_app_config_t.tx 决定第几类标准消息并取相关参数
@@ -465,7 +606,8 @@ static void rx_status_log(const monitor_t *mon, int64_t now_us, int64_t slot)
     if (now_us - last_log_us < 1000000) return;
     last_log_us = now_us;
 
-    const char *clock = (s_cfg.utc_enable && s_utc_ok) ? "UTC" : "本地";
+    const char *clock = s_utc_locked ? "UTC(GPS)"
+                     : (s_utc_ok ? "UTC(SNTP)" : "本地");
     const char *who = ((slot & 1) == (s_cfg.tx_slot_parity & 1)) ? "本台时隙" : "对端时隙";
     if (s_tx_busy) {
         ESP_LOGI(T, "[now] t=%lld.%03ds 时隙#%lld(%s) TX=发射中 RX=%d/%d块 已解%u(%u时隙) 时钟%s",
@@ -534,16 +676,24 @@ static void ft8_rx_task(void *arg)
              (double)cap_us / 1e6, (double)parse_us / 1e6, (double)budget_us / 1e6);
 
     for (;;) {
-        /* 对齐到下一个时隙起点(期间读并丢弃旧音频，保持 DMA 不积压) */
+        /* 尝试用 GPS UTC+PPS 锁存 UTC 相位(仅在启用且 GPS 就绪后锁一次) */
+        utc_try_lock_gps();
+        utc_ref_t ref;
+        utc_ref_get(&ref);
+
+        /* 对齐到“下一个时隙起点”：UTC 锁定时为 UTC 栅格(:00/:15/:30/:45)，
+         * 否则退回本地 esp_timer 栅格(此时 ref 映射是恒等) */
         int64_t now = esp_timer_get_time();
-        int64_t boundary = (now / slot_us + 1) * slot_us;
+        int64_t now_utc = utc_to_us(&ref, now);
+        int64_t cur_slot = now_utc / slot_us;
+        int64_t boundary = utc_from_us(&ref, (cur_slot + 1) * slot_us);
         while (esp_timer_get_time() < boundary) {
             rx_discard_chunk();
-            rx_status_log(&mon, esp_timer_get_time(), boundary / slot_us - 1);
+            rx_status_log(&mon, esp_timer_get_time(), cur_slot);
             vTaskDelay(pdMS_TO_TICKS(2));
         }
 
-        const int64_t slot_id = boundary / slot_us;
+        const int64_t slot_id = cur_slot + 1;   /* 即将接收的时隙号(UTC/本地) */
         const int64_t cap_end = boundary + cap_us;
 
         /* 接收段：从时隙起点连续采集喂瀑布，直到 cap_end(时隙结束前 parse_us) */
@@ -572,7 +722,7 @@ static void ft8_rx_task(void *arg)
         if (s_cfg.rx_enable) rx_decode_slot(&mon, slot_id, budget_us);
 
         int64_t after = esp_timer_get_time();
-        int64_t next_b = (slot_id + 1) * slot_us;
+        int64_t next_b = utc_from_us(&ref, (slot_id + 1) * slot_us);
         if (after > next_b) {
             ESP_LOGW(T, "解析耗时超时隙尾部%lldms，可能错过时隙 #%lld 开头",
                      (long long)((after - next_b) / 1000), (long long)(slot_id + 1));
@@ -623,15 +773,20 @@ static void ft8_tx_task(void *arg)
             continue;
         }
 
-        /* 找下一个“本台时隙”的可发射起点 */
+        /* 找下一个“本台时隙”的可发射起点(UTC 锁定时按 UTC 栅格/奇偶) */
+        utc_try_lock_gps();
+        utc_ref_t ref;
+        utc_ref_get(&ref);
         int64_t now = esp_timer_get_time();
-        int64_t slot = now / slot_us;
+        int64_t now_utc = utc_to_us(&ref, now);
+        int64_t slot = now_utc / slot_us;
         int64_t target = -1;
         for (int k = 0; k < 6; k++) {
             int64_t s = slot + k;
             if ((int)(s & 1) != parity) continue;              /* 只选本台时隙 */
-            int64_t st = s * slot_us + delay_us;
-            if (st + msg_us <= (s + 1) * slot_us && st > now + 30000) {
+            int64_t st = utc_from_us(&ref, s * slot_us) + delay_us;
+            int64_t se = utc_from_us(&ref, (s + 1) * slot_us);
+            if (st + msg_us <= se && st > now + 30000) {
                 target = st;
                 break;
             }
@@ -661,7 +816,7 @@ static void ft8_tx_task(void *arg)
         while (esp_timer_get_time() < target) { /* busy wait */ }
 
         ESP_LOGI(T, "[TX] 时隙 #%lld 于 %d.%03ds 起播",
-                 (long long)(target / slot_us),
+                 (long long)(utc_to_us(&ref, target) / slot_us),
                  (int)(target / 1000000), (int)((target / 1000) % 1000));
         s_tx_busy = true;
 
@@ -725,6 +880,7 @@ void ft8_app_config_default(ft8_app_config_t *cfg)
     cfg->tx_enable       = true;
     cfg->rx_enable       = true;
     cfg->utc_enable      = true;
+    cfg->gps_use_pps     = true;
     cfg->tx_slot_parity  = 0;
     cfg->tx_delay_ms     = 0;
     snprintf(cfg->callsign, sizeof(cfg->callsign), "BG7ABC");
@@ -784,11 +940,19 @@ esp_err_t ft8_app_start(const ft8_app_config_t *cfg)
     ESP_ERROR_CHECK(wm8978_i2s_start_rx());
     ESP_ERROR_CHECK(wm8978_i2s_start_tx());
 
+    s_utc_ok = false;
     if (s_cfg.utc_enable) {
-        s_utc_ok = (time(NULL) > SNTP_EPOCH_MIN);
-        ESP_LOGW(TAG, "utc_enable: 系统时间%s校准；栅格严格对齐按本地 esp_timer，"
-                 "UTC 亚秒相位需额外接入毫秒级墙钟",
-                 s_utc_ok ? "已" : "未");
+        if (s_cfg.gps_utc_enable) {
+            /* 选用 GPS UTC：任务会在 cfg.gps 有效且收到 PPS 后自动锁存相位并
+             * 把 RX/TX 时隙栅格对齐到 UTC(:00/:15/:30/:45) */
+            utc_try_lock_gps();
+            ESP_LOGW(TAG, "utc_enable(gps): 等待 GPS UTC+PPS(%s)，就绪后自动对齐 UTC 栅格",
+                     s_utc_ok ? "已就绪" : "未就绪");
+        } else {
+            s_utc_ok = (time(NULL) > SNTP_EPOCH_MIN);
+            ESP_LOGW(TAG, "utc_enable(SNTP): 系统时间%s校准(仅显示用，UTC 栅格对齐请改用 GPS PPS)",
+                     s_utc_ok ? "已" : "未");
+        }
     }
 
     xTaskCreatePinnedToCore(ft8_rx_task, "ft8_rx", STACK_RX, NULL, 6, &s_task_rx, 1);
