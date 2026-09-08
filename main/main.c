@@ -24,6 +24,10 @@
 
 #define TAG "main"
 
+/* FT8 应用全局配置：以引用交给 ft8_app(需保持有效)；
+ * 下面 gps_time_task 会持续把 GPS UTC 时间/日期/PPS 填入 cfg.gps */
+static ft8_app_config_t cfg;
+
 /* 屏幕显示本地时间所用时区(北京 = UTC+8)。UTC 直接显示可改为 0 */
 #define LCD_TZ_HOUR    8
 #define LCD_ROW_H      16                  /* 8x16 ASCII 行高 */
@@ -300,6 +304,46 @@ static void rgb_led_task(void *arg)
     }
 }
 
+/* ================= GPS UTC 时间 -> ft8_app 配置 =================
+ * GPS 模块自身已有后台 NMEA 解析任务(见 components/BSP/GPS)，这里只是把
+ * gps_get_info() 快照里的 UTC 时间/日期/PPS 拷贝进全局 cfg.gps，
+ * 供 ft8_app 在启用 gps_utc_enable 时做 UTC 时隙对齐。 */
+static void gps_time_task(void *arg)
+{
+    bool reported = false;
+    for (;;)
+    {
+        gps_info_t g;
+        gps_get_info(&g);
+
+        if (g.time_valid && g.date_valid && g.pps_seq > 0)
+        {
+            cfg.gps.valid       = true;
+            cfg.gps.year        = g.year;
+            cfg.gps.month       = g.month;
+            cfg.gps.day         = g.day;
+            cfg.gps.hour        = g.hour;
+            cfg.gps.minute      = g.minute;
+            cfg.gps.second      = g.second;
+            cfg.gps.millisecond = g.millisecond;
+            cfg.gps.pps_seq     = g.pps_seq;
+            cfg.gps.pps_edge_us = g.pps_edge_us;
+            if (!reported)
+            {
+                ESP_LOGI(TAG, "GPS UTC 就绪: %04u-%02u-%02u %02u:%02u:%02u.%03u PPS#%lu",
+                         g.year, g.month, g.day, g.hour, g.minute, g.second,
+                         (unsigned)g.millisecond, (unsigned long)g.pps_seq);
+                reported = true;
+            }
+        }
+        else
+        {
+            reported = false;   /* 失锁后再定位时重新上报 */
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
 static void my_key_callback(key_id_t key_id, key_event_t event, void *user_data)
 {
     /* 单击: 上/下/左/右 翻页, 中间键回首页 */
@@ -335,15 +379,16 @@ static void my_key_callback(key_id_t key_id, key_event_t event, void *user_data)
 void app_main(void)
 {
     key_init(my_key_callback, NULL);
+    gps_init();                       /* 启动 GPS NMEA/PPS 后台(幂等) */
 
     /* ====== FT8/FT4 配置示例 ====== */
-    static ft8_app_config_t cfg;    /* 必须保持有效：ft8_app 以引用方式使用它，运行中可直接改 */
     ft8_app_config_default(&cfg);
 
     cfg.protocol            = FTX_PROTOCOL_FT8;             /* FTX_PROTOCOL_FT4 切到 FT4(7.5s 时隙) */
     cfg.tx_enable           = true;                         /* 参与发射(仅在选中奇偶时隙) */
     cfg.rx_enable           = true;                         /* 持续解码 */
-    cfg.utc_enable          = true;                         /* 时隙对齐 UTC(:00/:15/:30/:45)，需先 SNTP 校时 */
+    cfg.utc_enable          = true;                         /* 总开关：按 UTC 对齐时隙 */
+    cfg.gps_utc_enable      = true;                         /* 选择使用 GPS 的 UTC 时间/日期对齐 */
     cfg.tx_slot_parity      = 0;                            /* 0=偶时隙发 / 1=奇时隙发，自动与对端交替 */
     cfg.tx_delay_ms         = 500;                          /* 本台时隙内再延时发射 */
     cfg.rx_parse_ms         = 100;                          /* 每个时隙结束前静默期(ms)，用于整窗解析 */    
@@ -366,6 +411,11 @@ void app_main(void)
     cfg.codec.hp_vol_l = 50; // L声道耳机音量 (0~63)
     cfg.codec.hp_vol_r = 50; // R声道耳机音量 (0~63)
     cfg.codec.spk_vol  = 40; // 音响音量 (0~63)
+
+    
+    /* 搬运 GPS UTC 时间/日期/PPS 进 cfg.gps(供 ft8_app UTC 对齐，先启动让它尽早喂数据) */
+    xTaskCreatePinnedToCore(gps_time_task, "gps_utc", 4096, NULL, 5, NULL, 1);
+
     if (ft8_app_start(&cfg) != ESP_OK)
     {
         ESP_LOGE(TAG, "ft8_app 启动失败");

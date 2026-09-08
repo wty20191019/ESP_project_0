@@ -25,8 +25,9 @@ extern "C" {
  *
  *   FT4 同理，只是时隙 7.5s、符号 0.048s(105 符号)。
  *
- *   要求：utc_enable=1 时系统时钟需已由 SNTP 校准(误差<1s)，否则自动
- *   回退到以上电时刻为起点的本地栅格(仅用于无网测试)。
+ *   要求：utc_enable=1 且 gps_utc_enable=1 时，时隙栅格用 GPS 的 UTC 时间
+ *   日期+PPS 上升沿对齐到 UTC(:00/:15/:30/:45)(由外部任务把 GPS 快照填入
+ *   cfg.gps)。未启用 GPS 或 GPS 未定位时回退到以上电时刻为起点的本地栅格。
  * ============================================================ */
 
 /**
@@ -73,6 +74,20 @@ typedef struct {
     uint8_t spk_vol;     /*!< 喇叭音量 0~63(0 静音)，WM8978_SPKvol_Set */
 } ft8_app_codec_cfg_t;
 
+/** GPS UTC 时间/日期与 PPS(由外部任务从 gps 快照填充，供 FT8 UTC 时隙对齐) */
+typedef struct {
+    bool     valid;          /*!< GPS UTC 时间+日期均有效 */
+    uint16_t year;           /*!< UTC 公元年，如 2026 */
+    uint8_t  month;          /*!< UTC 月 1~12 */
+    uint8_t  day;            /*!< UTC 日 1~31 */
+    uint8_t  hour;           /*!< UTC 时 0~23 */
+    uint8_t  minute;         /*!< UTC 分 0~59 */
+    uint8_t  second;         /*!< UTC 秒 0~59 */
+    uint16_t millisecond;    /*!< UTC 毫秒 0~999 */
+    uint32_t pps_seq;        /*!< GPS PPS 上升沿计数(>0 表示已收到秒脉冲) */
+    int64_t  pps_edge_us;    /*!< 最近一次 PPS 上升沿的 esp_timer 时刻(上电起 µs) */
+} ft8_app_gps_time_t;
+
 /** FT8/FT4 应用配置结构体 */
 typedef struct {
     /* ---- 协议与开关 ---- */
@@ -81,8 +96,16 @@ typedef struct {
     bool rx_enable;             /*!< 是否持续接收解码 */
 
     /* ---- 时间(宏观层) ---- */
-    bool utc_enable;            /*!< 用系统 UTC 时间对齐 15s/7.5s 栅格(需先 SNTP 校时)；
-                                 *    为 false 或时间未校准时退回本地栅格 */
+    bool utc_enable;            /*!< 总开关：按 UTC 对齐 15s/7.5s 栅格；
+                                 *    为 false 或没有可用 UTC 时钟时退回本地栅格 */
+    bool gps_utc_enable;        /*!< 选择使用 GPS 的 UTC 时间/日期对齐时隙
+                                 *    (需 utc_enable=1，且 cfg.gps 时间日期有效)；
+                                 *    为 false 时退用系统 time()(SNTP/RTC) */
+    bool gps_use_pps;           /*!< 使用 GPS UTC 时是否依赖 PPS 秒脉冲：
+                                 *    true = 必须收到 PPS(gps.pps_seq>0)才做亚秒级精确锁相；
+                                 *    false = 不用 PPS，用 NMEA 串口 UTC 时间做粗对齐
+                                 *            (误差可达数百 ms~1s，仅适合无 PPS 场合) */
+    ft8_app_gps_time_t gps;     /*!< GPS UTC 时间/日期与 PPS(由外部任务持续更新) */
     int  tx_slot_parity;        /*!< 0=在偶数时隙发射(WSJT-X "even" 默认)；
                                  *    1=在奇数时隙发射，对端自动落在另一奇偶 */
     uint32_t tx_delay_ms;       /*!< 本台时隙内再延时多少 ms 开始发射(0~时隙长-消息长) */
