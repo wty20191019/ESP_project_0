@@ -1366,10 +1366,10 @@ void ft8_app_config_default(ft8_app_config_t *cfg)
     cfg->ldpc_iterations  = 25;
 
     /* 自动 QSO 引擎默认: 关闭(保持原有手动 cfg.tx 行为), 主叫模式 */
-    cfg->qso.enable           = false;
-    cfg->qso.cq_mode          = true;
-    cfg->qso.max_retries      = 4;
-    cfg->qso.target_callsign[0] = '\0';
+    cfg->qso.enable           = false;      // 启用自动 QSO 引擎(启用才建队, RX 解码无队时不产生额外开销)
+    cfg->qso.cq_mode          = true;       // 主叫模式: 自动 CQ, 完成 QSO 后自动收下一个
+    cfg->qso.max_retries      = 4;          // 超过此次数仍无进展则放弃该台
+    cfg->qso.target_callsign[0] = '\0';     // 应答模式: 只应答此呼号, 空则应答所有陌生 CQ 台
 }
 
 esp_err_t ft8_app_start(const ft8_app_config_t *cfg)
