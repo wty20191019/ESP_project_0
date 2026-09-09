@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "ft8/constants.h"
+#include "ft8/message.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -88,6 +89,81 @@ typedef struct {
     int64_t  pps_edge_us;    /*!< 最近一次 PPS 上升沿的 esp_timer 时刻(上电起 µs) */
 } ft8_app_gps_time_t;
 
+
+/* 结构化解码消息(RX 任务 -> 引擎队列) */
+typedef struct {
+    ftx_message_type_t msg_type;
+    char call_to[16];
+    char call_de[16];
+    char extra[12];
+    ftx_field_t ftypes[FTX_MAX_MESSAGE_FIELDS];
+    float freq_hz;
+    float snr_db;
+    int64_t slot;
+} qso_rx_t;
+
+/* 语义事件(已按"发射方视角"归一化) */
+typedef enum {
+    QSO_EVT_NONE,   /* 与本站无关 */
+    QSO_EVT_CQ,     /* 对方呼叫 CQ(可应答) */
+    QSO_EVT_ANSWER, /* 对方回答我方 CQ(点我方呼号 + 网格) */
+    QSO_EVT_REPORT, /* 对方发我方信号报告(不带 R) */
+    QSO_EVT_RREPORT,/* 对方发我方 R 报告 */
+    QSO_EVT_RRR,    /* 对方 RRR */
+    QSO_EVT_RR73,   /* 对方 RR73 */
+    QSO_EVT_73,     /* 对方 73 */
+} qso_evt_kind_t;
+
+typedef struct {
+    qso_evt_kind_t kind;
+    char sender[16];   /* 发射方呼号 */
+    char grid[8];      /* 网格(仅 CQ/ANSWER) */
+    int  rst_db;       /* 报告 dB(仅报告类) */
+    int  parity;       /* 收到该消息的时隙奇偶(= 对方发射相位) */
+} qso_evt_t;
+
+/* QSO 状态机阶段(每阶段对应一份我方要发的 cfg.tx 内容) */
+typedef enum {
+    QSO_ST_IDLE,        /* 空闲: 主叫模式=CQ, 应答模式=静默 */
+    QSO_ST_REPORT,      /* 主叫: 已发 REPORT, 等对方 R 报告/结束 */
+    QSO_ST_RR73,        /* 主叫: 已发 RR73, 等对方 73 */
+    QSO_ST_CALL,        /* 应答: 已发 CALL, 等对方 REPORT */
+    QSO_ST_RRPT,        /* 应答: 已发 R 报告, 等对方 RR73/RRR */
+    QSO_ST_73,          /* 应答: 已决定发 73, 发完即完成 */
+} qso_state_t;
+
+/* 引擎任务运行时上下文 */
+typedef struct {
+    qso_state_t state;
+    bool engaged;           /* 是否已锁定某台在通联中 */
+    char peer[16];
+    char peer_grid[8];
+    int  peer_rst;          /* 对方报告给我们的 dB */
+    int  my_rst;            /* 我方发出的 dB */
+    int  tx_parity;         /* 我方发射时隙奇偶 */
+    int  attempts;          /* 当前阶段我方已发射次数 */
+    int64_t last_counted;   /* 已计数的我方时隙号 */
+} qso_ctx_t;
+
+/* 最近记录的呼号(完成=永久; 放弃=暂避 SKIP_AGE_SLOTS 个时隙) */
+typedef struct {
+    char call[16];
+    int64_t slot;
+    bool worked;
+} qso_recent_t;
+
+
+/** 自动 QSO 引擎配置(仅 ft8_app_start 启动时生效, 运行中改动也会热生效)。
+ *  引擎启用后会"接管" cfg.tx / cfg.tx_enable / cfg.tx_slot_parity,
+ *  手动改 cfg.tx 的方式将不再生效(被引擎覆盖)。 */
+typedef struct {
+    bool enable;                /*!< 总开关: 是否启用自动 QSO 引擎 */
+    bool cq_mode;               /*!< true=主叫模式: 自动发 CQ 并等待/完成应答;
+                                 *     false=应答模式: 不主动发射, 解码到陌生 CQ 台后自动应答 */
+    int  max_retries;           /*!< 每个 QSO 阶段我方最多发射重试的次数(超出则放弃该台) */
+    char target_callsign[16];   /*!< 应答模式定向呼叫对象, 留空=自动选择解码到的 CQ 台 */
+} ft8_qso_config_t;
+
 /** FT8/FT4 应用配置结构体 */
 typedef struct {
     /* ---- 协议与开关 ---- */
@@ -133,6 +209,8 @@ typedef struct {
     int ldpc_iterations;        /*!< LDPC 最大迭代次数 把瀑布幅度转成软比特，再用置信传播迭代解码 越多：纠错越强，弱/被干扰的信号越可能解出来，但每个候选的耗时近似成正比；越少：快但容易解不出弱台。 */
     uint32_t rx_parse_ms;       /*!< 每个时隙结束前提前多少 ms 停止接收并开始解析
                                  *    (下限 1500ms，默认 1500；过小会被钳到 1.5s 以免解码拖入下一时隙) */
+
+    ft8_qso_config_t qso;       /*!< 自动 QSO 引擎配置(enable=1 时引擎接管 cfg.tx) */
 
     uint8_t _reserved[8];
 } ft8_app_config_t;

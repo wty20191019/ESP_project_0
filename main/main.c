@@ -409,12 +409,20 @@ void app_main(void)
 
     /* WM8978 编解码器参数(对应原硬编码的 ADDA(1,1)/Input(1,1,0)/MIC40/Output(1,0)/I2S(2,0)/HP(50,50)/SPK40，
      * 默认已一致，这里仅示例按需修改) */
-    cfg.codec.mic_gain = 40; // MIC 增益 0~63(-12~+35.25dB，0.75dB/步)
-    cfg.codec.hp_vol_l = 50; // L声道耳机音量 (0~63)
-    cfg.codec.hp_vol_r = 50; // R声道耳机音量 (0~63)
-    cfg.codec.spk_vol  = 40; // 音响音量 (0~63)
+    cfg.codec.mic_gain = 40;                        // MIC 增益 0~63(-12~+35.25dB，0.75dB/步)
+    cfg.codec.hp_vol_l = 50;                        // L声道耳机音量 (0~63)
+    cfg.codec.hp_vol_r = cfg.codec.hp_vol_l;        // R声道耳机音量 (0~63)
+    cfg.codec.spk_vol  = 0;                         // 音响音量 (0~63)
 
-    
+    cfg.qso.enable           = true ;      // 启用自动 QSO 引擎(启用才建队, RX 解码无队时不产生额外开销)
+    cfg.qso.cq_mode          = true ;      // 主叫模式: 自动 CQ, 完成 QSO 后自动收下一个
+    cfg.qso.max_retries      = 4;          // 超过此次数仍无进展则放弃该台
+    cfg.qso.target_callsign[0] = '\0';     // 应答模式: 只应答此呼号, 空则应答所有陌生 CQ 台
+
+    //true 
+    //false
+
+    //启动任务============================================================================================
     /* 搬运 GPS UTC 时间/日期/PPS 进 cfg.gps(供 ft8_app UTC 对齐，先启动让它尽早喂数据) */
     xTaskCreatePinnedToCore(gps_time_task, "gps_utc", 4096, NULL, 5, NULL, 1);
 
@@ -431,4 +439,6 @@ void app_main(void)
 
     xTaskCreatePinnedToCore(LCD_task, "LCD", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(rgb_led_task, "rgb_led", 2048, NULL, 1, NULL, 0);
+
+
 }
