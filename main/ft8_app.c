@@ -9,6 +9,7 @@
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "ft8/encode.h"
 #include "ft8/decode.h"
 #include "ft8/message.h"
@@ -29,10 +30,9 @@
  *  两个任务各自操作 I2S0 的 TX/RX 方向(全双工)，互不阻塞。
  *  波形：GFSK 高斯成形(官方 gen_ft8 算法)，PSRAM 预生成。
  *
- *  ⚠ 时隙栅格：默认以 esp_timer(上电时刻) 为 0 的本地栅格做严格
- *    对齐；若需真正对齐 UTC(:00/:15/:30/:45)，需先接入 SNTP 且提供
- *    毫秒级墙钟(当前 time() 只有秒级，无法把 esp_timer 相位映射到
- *    UTC 亚秒，只会保证奇偶相位正确)。启用 utc_enable 仅用于校验。
+ *  ⚠ 时隙栅格：utc_enable+gps_utc_enable 且 GPS UTC+PPS 就绪时，用 GPS 把
+ *    esp_timer 相位映射到 UTC，按 UTC(:00/:15/:30/:45) 栅格收发；GPS 未
+ *    就绪时回退到以 esp_timer(上电时刻)为 0 的本地栅格(仅用于无网测试)。
  * ============================================================ */
 
 #define FT8_AUDIO_RATE      12000
@@ -81,6 +81,148 @@ static bool app_is_ft4(void)             { return s_cfg.protocol == FTX_PROTOCOL
 static int  app_sym_samples(void)        { return app_is_ft4() ? 576 : 1920; }
 static int  app_nsym(void)               { return app_is_ft4() ? FT4_NN : FT8_NN; }
 static int64_t app_slot_us(void)         { return app_is_ft4() ? (int64_t)7500000 : (int64_t)15000000; }
+
+/* ============================================================
+ * UTC 栅格映射：esp_timer ↔ GPS UTC
+ * 用 GPS 的 PPS 上升沿(esp_timer 时刻)配合同一时刻的 UTC 时间，得到
+ * “esp_timer 时刻 ↔ UTC 秒”的固定相位关系，之后 RX/TX 都按 UTC 的
+ * 15s/7.5s 栅格(整分钟 :00/:15/:30/:45)计算时隙，实现真正 UTC 对齐。
+ * 校准只在 GPS UTC+PPS 首次有效时锁存一次(esp_timer 晶振漂移可忽略)。
+ * ============================================================ */
+static portMUX_TYPE s_utc_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool     s_utc_locked = false;      /* 已用 GPS 校准 UTC 相位 */
+static int64_t  s_utc_edge_us = 0;         /* 校准点：PPS 上升沿的 esp_timer µs */
+static int64_t  s_utc_edge_sec = 0;        /* 校准点：该沿对应的 UTC 秒(1970 起) */
+
+/* 儒略日(公历) -> 自 1970-01-01 的天数 */
+static int64_t utc_days_from_civil(int64_t y, int64_t m, int64_t d)
+{
+    y -= m <= 2;
+    int64_t era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153u * (unsigned)(m + (m > 2 ? -3 : 9)) + 2) / 5u + (unsigned)d - 1u;
+    unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    return era * 146097 + (int64_t)doe - 719468;
+}
+
+static int64_t utc_to_epoch_s(const ft8_app_gps_time_t *g)
+{
+    int64_t days = utc_days_from_civil(g->year, g->month, g->day);
+    return days * 86400 + g->hour * 3600 + g->minute * 60 + g->second;
+}
+
+typedef struct {
+    bool    locked;
+    int64_t edge_us;
+    int64_t edge_sec;
+} utc_ref_t;
+
+static void utc_ref_get(utc_ref_t *r)
+{
+    portENTER_CRITICAL(&s_utc_mux);
+    r->locked    = s_utc_locked;
+    r->edge_us   = s_utc_edge_us;
+    r->edge_sec  = s_utc_edge_sec;
+    portEXIT_CRITICAL(&s_utc_mux);
+}
+
+/* esp_timer now_us -> UTC 微秒(自1970)；未锁定时原样返回(本地栅格) */
+static int64_t utc_to_us(const utc_ref_t *r, int64_t now_us)
+{
+    if (!r->locked) return now_us;
+    return r->edge_sec * 1000000LL + (now_us - r->edge_us);
+}
+
+/* UTC 微秒 -> esp_timer 微秒 */
+static int64_t utc_from_us(const utc_ref_t *r, int64_t utc_us)
+{
+    if (!r->locked) return utc_us;
+    return r->edge_us + (utc_us - r->edge_sec * 1000000LL);
+}
+
+static bool gps_cfg_eq(const ft8_app_gps_time_t *a, const ft8_app_gps_time_t *b)
+{
+    return a->valid == b->valid &&
+           a->year == b->year && a->month == b->month && a->day == b->day &&
+           a->hour == b->hour && a->minute == b->minute && a->second == b->second &&
+           a->millisecond == b->millisecond && a->pps_seq == b->pps_seq &&
+           a->pps_edge_us == b->pps_edge_us;
+}
+
+/* 稳定读取 cfg.gps(避免另一核写入时读到撕裂的 64 位字段) */
+static bool gps_cfg_get(ft8_app_gps_time_t *out)
+{
+    ft8_app_gps_time_t a, b;
+    for (int i = 0; i < 4; i++) {
+        a = s_cfg.gps;
+        b = s_cfg.gps;
+        if (gps_cfg_eq(&a, &b)) {
+            *out = a;
+            return a.valid;
+        }
+    }
+    return false;
+}
+
+/* 若启用 GPS UTC 且 GPS 时间已就绪，则锁存一次 UTC 相位。
+ *  - gps_use_pps=true：用 PPS 上升沿做亚秒精对齐；为排除“PPS 已进到下一秒而
+ *    NMEA 时间还没更新”的短暂错位，要求两次采样 pps_seq 与 UTC 秒同步前进。
+ *  - gps_use_pps=false：不用 PPS，把解析到该 UTC 秒的 esp_timer 时刻近似当作
+ *    该秒起点(NMEA 粗对齐，误差可达数百 ms~1s，仅适合无 PPS 场合)。 */
+static void utc_try_lock_gps(void)
+{
+    if (s_utc_locked) return;
+    if (!s_cfg.utc_enable || !s_cfg.gps_utc_enable) return;
+
+    const bool use_pps = s_cfg.gps_use_pps;
+
+    ft8_app_gps_time_t g;
+    if (!gps_cfg_get(&g) || !g.valid) return;
+    if (use_pps && g.pps_seq == 0) return;              /* 要求 PPS 但尚未收到 */
+
+    static uint32_t prev_seq = 0;
+    static uint8_t  prev_sec = 0;
+    static bool     have_prev = false;
+
+    if (use_pps) {
+        if (!have_prev) {
+            prev_seq = g.pps_seq;
+            prev_sec = g.second;
+            have_prev = true;
+            return;
+        }
+        uint32_t dseq = g.pps_seq - prev_seq;           /* PPS 前进步数 */
+        int dsec = (int)g.second - (int)prev_sec;
+        if (dsec < 0) dsec += 60;                       /* 跨分钟回绕 */
+        prev_seq = g.pps_seq;
+        prev_sec = g.second;
+        if (dseq < 1 || dsec != (int)dseq) return;      /* 时间与 PPS 未同步前进 */
+    }
+
+    int64_t sec = utc_to_epoch_s(&g);
+    if (sec < 946684800LL) return;                      /* 早于 2000-01-01 视为无效 */
+
+    /* PPS 精对齐：校准点取 PPS 上升沿；NMEA 粗对齐：校准点取“当前解析时刻” */
+    int64_t edge_us = use_pps ? g.pps_edge_us : esp_timer_get_time();
+    bool    locked_now = false;
+    portENTER_CRITICAL(&s_utc_mux);
+    if (!s_utc_locked) {
+        s_utc_locked    = true;
+        s_utc_edge_us   = edge_us;
+        s_utc_edge_sec  = sec;
+        s_utc_ok        = true;
+        locked_now      = true;
+    }
+    portEXIT_CRITICAL(&s_utc_mux);
+
+    if (locked_now) {
+        ESP_LOGI(TAG, "GPS UTC 相位已校准(%s): %04u-%02u-%02u %02u:%02u:%02u.%03u "
+                 "PPS#%lu edge=%lldus",
+                 use_pps ? "PPS" : "NMEA粗对齐",
+                 g.year, g.month, g.day, g.hour, g.minute, g.second, g.millisecond,
+                 (unsigned long)g.pps_seq, (long long)edge_us);
+    }
+}
 
 /* ============================================================
  * 发送消息：按 ft8_app_config_t.tx 决定第几类标准消息并取相关参数
@@ -310,6 +452,9 @@ static void hash_save(const char *callsign, uint32_t n22)
 }
 static ftx_callsign_hash_interface_t s_hash_if = { hash_lookup, hash_save };
 
+/* RX 解码成功后将结构化解码消息投递给自动 QSO 引擎(定义见文件尾部) */
+static void qso_rx_publish(const ftx_message_t *msg, float freq_hz, float snr_db, int64_t slot);
+
 /* 估算一条已解码消息的信号强度(近似 FT8/FT4 的 SNR，折算到 2500Hz 参考带宽)：
  *  - 信号 dB：整条消息在实际发送 tone 频点上的平均幅度；
  *  - 噪声 dB：同一符号内其余 n_tones-1 个 tone 频点的平均幅度(本地参考)；
@@ -321,14 +466,14 @@ static float rx_measure_snr(const ftx_waterfall_t *wf, const ftx_candidate_t *ca
 {
     if (wf == NULL || wf->mag == NULL || cand == NULL || tones == NULL)
         return NAN;
-    if (n_tones < 2 || bin_bw_hz <= 0.0f || cand->time_offset < 0 || cand->freq_offset < 0)
+    if (n_tones < 2 || bin_bw_hz <= 0.0f || cand->freq_offset < 0)
         return NAN;
     if (cand->freq_offset + n_tones > wf->num_bins)
         return NAN;
 
-    int base = cand->time_offset;
-    base = (base * wf->time_osr + cand->time_sub) * wf->freq_osr + cand->freq_sub;
-    base = base * wf->num_bins + cand->freq_offset;
+    /* time_offset 允许为负: 消息起点可能早于本时隙采集窗口(前一两个符号溢出到
+     * 上一时隙)。这类符号没有数据, 下面按 block_abs 跳过; 只要窗内符号够多
+     * (n_sig>=4) 仍可估算, 不再因起点略早而整体放弃。 */
 
     double sum_sig = 0.0, sum_nse = 0.0;
     int n_sig = 0, n_nse = 0;
@@ -336,7 +481,12 @@ static float rx_measure_snr(const ftx_waterfall_t *wf, const ftx_candidate_t *ca
     for (int s = 0; s < n_syms; s++) {
         int block_abs = cand->time_offset + s;   /* 消息符号 s 对应的捕获块 */
         if (block_abs < 0 || block_abs >= wf->num_blocks) continue;
-        const WF_ELEM_T *p = wf->mag + base + (size_t)s * wf->block_stride;
+        /* 布局: mag[块][time_osr][freq_osr][num_bins]; 取该块子采样/频偏位置 */
+        int within = cand->time_sub * (wf->freq_osr * wf->num_bins) +
+                     cand->freq_sub * wf->num_bins + cand->freq_offset;
+        const WF_ELEM_T *p = wf->mag +
+                             (size_t)block_abs * (size_t)wf->block_stride +
+                             (size_t)within;
         int t = tones[s];                        /* 该符号实际发送的 tone 序号 */
         if (t < 0 || t >= n_tones) continue;
         sum_sig += WF_ELEM_MAG(p[t]);
@@ -437,6 +587,9 @@ static void rx_decode_slot(monitor_t *mon, int64_t prev_slot, int64_t budget_us)
         if (isfinite(snr_db)) snprintf(snr_str, sizeof(snr_str), "%+.0fdB", snr_db);
         else                  snprintf(snr_str, sizeof(snr_str), "--dB");
 
+        /* 投递给自动 QSO 引擎(启用时才建队, 无队则此调用为空操作) */
+        qso_rx_publish(&msg, f_hz, snr_db, prev_slot);
+
         s_stat_decoded++;
         ESP_LOGI(T, "[RX] %s @%0.0fHz t=%0.2fs SNR=%s: %s",
                  ft4 ? "FT4" : "FT8", (double)f_hz, (double)t_s, snr_str, text);
@@ -465,7 +618,8 @@ static void rx_status_log(const monitor_t *mon, int64_t now_us, int64_t slot)
     if (now_us - last_log_us < 1000000) return;
     last_log_us = now_us;
 
-    const char *clock = (s_cfg.utc_enable && s_utc_ok) ? "UTC" : "本地";
+    const char *clock = s_utc_locked ? "UTC(GPS)"
+                     : (s_utc_ok ? "UTC(SNTP)" : "本地");
     const char *who = ((slot & 1) == (s_cfg.tx_slot_parity & 1)) ? "本台时隙" : "对端时隙";
     if (s_tx_busy) {
         ESP_LOGI(T, "[now] t=%lld.%03ds 时隙#%lld(%s) TX=发射中 RX=%d/%d块 已解%u(%u时隙) 时钟%s",
@@ -481,6 +635,72 @@ static void rx_status_log(const monitor_t *mon, int64_t now_us, int64_t slot)
                  mon->wf.num_blocks, mon->wf.max_blocks,
                  (unsigned)s_stat_decoded, (unsigned)s_stat_slots, clock);
     }
+}
+
+/* ============================================================
+ * 瀑布显示快照(RX 每收到一个符号块, 压缩成一行功率谱, 供 LCD 绘制)
+ * 写入端: ft8_rx_task(core1); 读取端: LCD 任务(core0)。
+ * 无锁设计: 读端容忍看到一帧正在写入的行(写入 160ms 才一行, 风险可忽略)。
+ * ============================================================ */
+static ft8_wf_snap_t *s_wf = NULL;
+
+static void wf_snap_alloc(void)
+{
+    if (s_wf) return;
+    ft8_wf_snap_t *w = heap_caps_malloc(sizeof(*w), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (w == NULL) w = malloc(sizeof(*w));
+    if (w) {
+        memset(w, 0, sizeof(*w));
+        s_wf = w;
+    } else {
+        ESP_LOGE(TAG, "瀑布快照内存不足, 瀑布页将无数据");
+    }
+}
+
+/* 把 monitor 刚写完的符号块(num_blocks-1)压缩成一行 FT8_WF_COLS 点功率谱。
+ * mag 布局: [块][time_osr][freq_osr][num_bins], 值 0..255(≈-120..0dB)。 */
+static void wf_disp_add(const ftx_waterfall_t *wf)
+{
+    if (wf == NULL || wf->mag == NULL) return;
+    if (wf->num_blocks <= 0 || wf->num_blocks > wf->max_blocks) return;
+    if (wf->num_bins <= 0) return;
+
+    if (s_wf == NULL) wf_snap_alloc();
+    if (s_wf == NULL) return;
+
+    const int nb     = wf->num_bins;
+    const int stride = wf->block_stride;
+    const int t_osr  = wf->time_osr > 0 ? wf->time_osr : 1;
+    const int f_osr  = wf->freq_osr > 0 ? wf->freq_osr : 1;
+    const int os     = (wf->num_blocks - 1) * stride;   /* 最新块的起始 */
+
+    uint8_t *row = s_wf->rows[s_wf->put];
+    for (int c = 0; c < FT8_WF_COLS; c++) {
+        int lo = (c * nb) / FT8_WF_COLS;
+        int hi = ((c + 1) * nb) / FT8_WF_COLS;
+        if (hi <= lo) hi = lo + 1;
+        if (lo >= nb) { row[c] = 0; continue; }
+        if (hi > nb) hi = nb;
+
+        uint8_t mx = 0;
+        for (int b = lo; b < hi; b++) {                 /* 列内 bin(取峰值) */
+            for (int t = 0; t < t_osr; t++) {
+                int base = os + (t * f_osr) * nb;
+                for (int f = 0; f < f_osr; f++) {
+                    uint8_t v = wf->mag[base + f * nb + b];
+                    if (v > mx) mx = v;
+                }
+            }
+        }
+        row[c] = mx;
+    }
+    s_wf->put = (s_wf->put + 1) % FT8_WF_ROWS;
+    s_wf->seq++;
+}
+
+const ft8_wf_snap_t *ft8_wf_snap(void)
+{
+    return s_wf;
 }
 
 static void ft8_rx_task(void *arg)
@@ -534,16 +754,24 @@ static void ft8_rx_task(void *arg)
              (double)cap_us / 1e6, (double)parse_us / 1e6, (double)budget_us / 1e6);
 
     for (;;) {
-        /* 对齐到下一个时隙起点(期间读并丢弃旧音频，保持 DMA 不积压) */
+        /* 尝试用 GPS UTC+PPS 锁存 UTC 相位(仅在启用且 GPS 就绪后锁一次) */
+        utc_try_lock_gps();
+        utc_ref_t ref;
+        utc_ref_get(&ref);
+
+        /* 对齐到“下一个时隙起点”：UTC 锁定时为 UTC 栅格(:00/:15/:30/:45)，
+         * 否则退回本地 esp_timer 栅格(此时 ref 映射是恒等) */
         int64_t now = esp_timer_get_time();
-        int64_t boundary = (now / slot_us + 1) * slot_us;
+        int64_t now_utc = utc_to_us(&ref, now);
+        int64_t cur_slot = now_utc / slot_us;
+        int64_t boundary = utc_from_us(&ref, (cur_slot + 1) * slot_us);
         while (esp_timer_get_time() < boundary) {
             rx_discard_chunk();
-            rx_status_log(&mon, esp_timer_get_time(), boundary / slot_us - 1);
+            rx_status_log(&mon, esp_timer_get_time(), cur_slot);
             vTaskDelay(pdMS_TO_TICKS(2));
         }
 
-        const int64_t slot_id = boundary / slot_us;
+        const int64_t slot_id = cur_slot + 1;   /* 即将接收的时隙号(UTC/本地) */
         const int64_t cap_end = boundary + cap_us;
 
         /* 接收段：从时隙起点连续采集喂瀑布，直到 cap_end(时隙结束前 parse_us) */
@@ -562,6 +790,7 @@ static void ft8_rx_task(void *arg)
             if (s_cfg.rx_enable) {
                 for (int i = 0; i < sym_samples; i++) fr[i] = (float)ablk[i * 2] * (1.0f / 32768.0f);
                 monitor_process(&mon, fr);
+                wf_disp_add(&mon.wf);      /* 新符号入瀑布, 供 LCD 页绘制 */
             }
             now = esp_timer_get_time();
             rx_status_log(&mon, now, slot_id);
@@ -572,7 +801,7 @@ static void ft8_rx_task(void *arg)
         if (s_cfg.rx_enable) rx_decode_slot(&mon, slot_id, budget_us);
 
         int64_t after = esp_timer_get_time();
-        int64_t next_b = (slot_id + 1) * slot_us;
+        int64_t next_b = utc_from_us(&ref, (slot_id + 1) * slot_us);
         if (after > next_b) {
             ESP_LOGW(T, "解析耗时超时隙尾部%lldms，可能错过时隙 #%lld 开头",
                      (long long)((after - next_b) / 1000), (long long)(slot_id + 1));
@@ -593,45 +822,40 @@ static void ft8_tx_task(void *arg)
     const int nsym = app_nsym();
     const int64_t slot_us = app_slot_us();
     const int64_t msg_us = (int64_t)nsym * sym_samples * 1000000LL / FT8_AUDIO_RATE;
-    const int64_t delay_us = (int64_t)s_cfg.tx_delay_ms * 1000;
-    const int parity = s_cfg.tx_slot_parity & 1;
-    const bool fits = (delay_us + msg_us <= slot_us);
 
-    if (s_cfg.tx_enable && !fits) {
-        ESP_LOGW(T, "发射延时+时长超时隙(%d.%03ds)，TX 关闭，仅接收",
-                 (int)(delay_us / 1000000), (int)((delay_us / 1000) % 1000));
-        s_cfg.tx_enable = false;
-    }
-    /* 启动时按初始配置预生成第一帧波形(失败则关闭 TX) */
-    if (s_cfg.tx_enable && !tx_wave_refresh()) {
-        ESP_LOGE(T, "发射不可用(编码失败或内存不足)，TX 关闭");
-        s_cfg.tx_enable = false;
-    }
-    if (!s_cfg.tx_enable) {
-        ESP_LOGI(T, "TX 已关闭，仅接收");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    ESP_LOGI(T, "TX 任务启动: 奇偶时隙=%d 延时=%dms 时长=%.3fs",
-             parity, (int)s_cfg.tx_delay_ms, (double)msg_us / 1000000.0);
+    ESP_LOGI(T, "TX 任务启动(自动 QSO 引擎可运行中开关/切相位)");
 
     for (;;) {
+        /* ---- 每轮实时读取, 支持自动 QSO 引擎在运行中开关/改奇偶/改内容 ---- */
+        const int parity = s_cfg.tx_slot_parity & 1;
+        const int64_t delay_us = (int64_t)s_cfg.tx_delay_ms * 1000;
+        const bool fits = (delay_us + msg_us <= slot_us);
+
+        if (!s_cfg.tx_enable || !fits) {
+            vTaskDelay(pdMS_TO_TICKS(250));
+            continue;
+        }
+
         /* 运行时改了类型/参数 -> 空闲期重建波形(见 tx_wave_refresh) */
         if (!tx_wave_refresh()) {
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
 
-        /* 找下一个“本台时隙”的可发射起点 */
+        /* 找下一个“本台时隙”的可发射起点(UTC 锁定时按 UTC 栅格/奇偶) */
+        utc_try_lock_gps();
+        utc_ref_t ref;
+        utc_ref_get(&ref);
         int64_t now = esp_timer_get_time();
-        int64_t slot = now / slot_us;
+        int64_t now_utc = utc_to_us(&ref, now);
+        int64_t slot = now_utc / slot_us;
         int64_t target = -1;
         for (int k = 0; k < 6; k++) {
             int64_t s = slot + k;
             if ((int)(s & 1) != parity) continue;              /* 只选本台时隙 */
-            int64_t st = s * slot_us + delay_us;
-            if (st + msg_us <= (s + 1) * slot_us && st > now + 30000) {
+            int64_t st = utc_from_us(&ref, s * slot_us) + delay_us;
+            int64_t se = utc_from_us(&ref, (s + 1) * slot_us);
+            if (st + msg_us <= se && st > now + 30000) {
                 target = st;
                 break;
             }
@@ -661,7 +885,7 @@ static void ft8_tx_task(void *arg)
         while (esp_timer_get_time() < target) { /* busy wait */ }
 
         ESP_LOGI(T, "[TX] 时隙 #%lld 于 %d.%03ds 起播",
-                 (long long)(target / slot_us),
+                 (long long)(utc_to_us(&ref, target) / slot_us),
                  (int)(target / 1000000), (int)((target / 1000) % 1000));
         s_tx_busy = true;
 
@@ -716,6 +940,462 @@ static void ft8_tx_task(void *arg)
 }
 
 /* ============================================================
+ * 自动 QSO 引擎(一个真正的 FT8/FT4 通联状态机)
+ *
+ * 数据流:
+ *   RX 任务在 rx_decode_slot 把每条解码成功的消息结构化成 qso_rx_t
+ *   (标准消息三字段 call_to/call_de/extra + 字段类型 + 频率/SNR/时隙),
+ *   经 s_qso_q 队列投递到本引擎任务。
+ *   引擎按"发射方视角"识别消息语义并驱动状态机, 通过改写 cfg.tx /
+ *   cfg.tx_enable / cfg.tx_slot_parity 让 TX 任务在下一个本台时隙发射
+ *   (复用现成的"热切换"机制, 引擎不直接操作音频)。
+ *
+ * FT8 通联约定(标准消息恒为 "<目标> <发射方> <第三字段>"):
+ *   主叫(CQ 模式)   : CQ -> 等对方回答(点我方呼号+网格) -> 我方 REPORT
+ *                     -> 等对方 R 报告 -> 我方 RR73 -> 等对方 73 结束
+ *   应答(应答模式)   : 听到陌生 CQ -> 我方 CALL(对格) -> 等对方 REPORT
+ *                     -> 我方 R 报告(回显) -> 等对方 RR73/RRR -> 我方 73 结束
+ *   两个阶段之间的"我方时隙"会由 TX 任务自动重复当前内容, 引擎按
+ *   我方时隙计数, 超过 max_retries 仍无进展则放弃该台。
+ * ============================================================ */
+#define QSO_QUEUE_LEN       24
+#define QSO_RECENT_MAX      12
+#define QSO_SKIP_AGE_SLOTS  48   /* 放弃后暂不重呼的时隙数(FT8≈12分钟) */
+#define QSO_LOG_MAX         10
+
+/* 引擎数据结构(类型定义见 ft8_qso.h) */
+static QueueHandle_t s_qso_q = NULL;
+
+static qso_recent_t s_recent[QSO_RECENT_MAX];
+static int s_recent_n = 0;
+
+/* 完成的 QSO 环形日志(用于串口/将来接 LCD) */
+static char s_qso_log[QSO_LOG_MAX][72];
+static int  s_qso_log_head = 0;
+static int  s_qso_log_n = 0;
+
+/* ---------------- 小工具 ---------------- */
+
+/* 报告文本如 -07 / R-12 / +05 -> dB 数值 */
+static int qso_db_parse(const char *s)
+{
+    if (s == NULL) return 0;
+    if (*s == 'R') s++;
+    if (*s == '\0') return 0;
+    char *end = NULL;
+    long v = strtol(s, &end, 10);
+    return (end != s) ? (int)v : 0;
+}
+
+/* extra 是否像网格(纯字母数字 4~8 位) */
+static bool str_is_gridish(const char *s)
+{
+    if (s == NULL) return false;
+    size_t n = strlen(s);
+    if (n < 4 || n > 8) return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')))
+            return false;
+    }
+    return true;
+}
+
+/* 当前 UTC/本地时隙号(与 RX/TX 任务同一把尺子) */
+static int64_t qso_now_slot(void)
+{
+    utc_try_lock_gps();
+    utc_ref_t ref;
+    utc_ref_get(&ref);
+    int64_t now = esp_timer_get_time();
+    return utc_to_us(&ref, now) / app_slot_us();
+}
+
+/* 时间戳(有 GPS 用 UTC, 否则显示 UTC--) */
+static void qso_time_str(char *buf, size_t n)
+{
+    ft8_app_gps_time_t g;
+    if (gps_cfg_get(&g) && g.valid)
+        snprintf(buf, n, "%02u:%02u:%02u", g.hour, g.minute, g.second);
+    else
+        snprintf(buf, n, "UTC--:--:--");
+}
+
+/* ---------------- 解码消息发布(RX 任务调用) ---------------- */
+static void qso_rx_publish(const ftx_message_t *msg, float freq_hz, float snr_db, int64_t slot)
+{
+    if (s_qso_q == NULL || msg == NULL) return;
+
+    const ftx_message_type_t t = ftx_message_get_type(msg);
+    if (t != FTX_MESSAGE_TYPE_STANDARD && t != FTX_MESSAGE_TYPE_NONSTD_CALL) return;
+
+    qso_rx_t m;
+    memset(&m, 0, sizeof(m));
+    m.msg_type = t;
+    m.freq_hz  = freq_hz;
+    m.snr_db   = snr_db;
+    m.slot     = slot;
+
+    ftx_message_rc_t rc;
+    if (t == FTX_MESSAGE_TYPE_STANDARD)
+        rc = ftx_message_decode_std(msg, &s_hash_if, m.call_to, m.call_de, m.extra, m.ftypes);
+    else
+        rc = ftx_message_decode_nonstd(msg, &s_hash_if, m.call_to, m.call_de, m.extra, m.ftypes);
+    if (rc != FTX_MESSAGE_RC_OK) return;
+    if (m.call_to[0] == '\0' || m.call_de[0] == '\0') return;
+
+    /* 队列满直接丢弃, 不阻塞 RX 解码 */
+    xQueueSend(s_qso_q, &m, 0);
+}
+
+/* ---------------- 最近呼号去重 ---------------- */
+static bool qso_blocked(const char *call, int64_t now_slot)
+{
+    for (int i = 0; i < s_recent_n; i++) {
+        if (strcmp(s_recent[i].call, call) == 0) {
+            if (s_recent[i].worked) return true;               /* 已完成: 本次会话不再重复通联 */
+            return (now_slot - s_recent[i].slot) < QSO_SKIP_AGE_SLOTS; /* 刚放弃: 暂避一会 */
+        }
+    }
+    return false;
+}
+
+static void qso_note(const char *call, int64_t slot, bool worked)
+{
+    for (int i = 0; i < s_recent_n; i++) {
+        if (strcmp(s_recent[i].call, call) == 0) {
+            s_recent[i].slot = slot;
+            if (worked) s_recent[i].worked = true;   /* 只升级为"已完成", 不降级 */
+            return;
+        }
+    }
+    if (s_recent_n < QSO_RECENT_MAX) {
+        strncpy(s_recent[s_recent_n].call, call, sizeof(s_recent[0].call) - 1);
+        s_recent[s_recent_n].call[sizeof(s_recent[0].call) - 1] = '\0';
+        s_recent[s_recent_n].slot = slot;
+        s_recent[s_recent_n].worked = worked;
+        s_recent_n++;
+    } else {
+        /* 满: 覆盖最老一条 */
+        int old = 0;
+        for (int i = 1; i < QSO_RECENT_MAX; i++)
+            if (s_recent[i].slot < s_recent[old].slot) old = i;
+        strncpy(s_recent[old].call, call, sizeof(s_recent[0].call) - 1);
+        s_recent[old].call[sizeof(s_recent[0].call) - 1] = '\0';
+        s_recent[old].slot = slot;
+        s_recent[old].worked = worked;
+    }
+}
+
+/* ---------------- QSO 日志 ---------------- */
+static void qso_log_raw(const char *line)
+{
+    ESP_LOGI("ft8_qso", "%s", line);
+    strncpy(s_qso_log[s_qso_log_head], line, sizeof(s_qso_log[0]) - 1);
+    s_qso_log[s_qso_log_head][sizeof(s_qso_log[0]) - 1] = '\0';
+    s_qso_log_head = (s_qso_log_head + 1) % QSO_LOG_MAX;
+    if (s_qso_log_n < QSO_LOG_MAX) s_qso_log_n++;
+}
+
+/* ---------------- 状态机动作 ---------------- */
+
+/* 按当前状态把"要发什么"写入 cfg(引擎接管 cfg.tx) */
+static void qso_apply(qso_ctx_t *c)
+{
+    ft8_app_config_t *C = s_cfg_p;
+
+    C->tx.call_to[0]   = '\0';
+    C->tx.cq_modifier[0] = '\0';
+    C->tx.rst_db       = 0;
+    C->tx_slot_parity  = c->tx_parity & 1;
+
+    if (c->state == QSO_ST_IDLE) {
+        if (s_cfg.qso.cq_mode) {
+            C->tx_enable = true;                      /* 主叫: 持续 CQ */
+            C->tx.type   = FT8_APP_MSG_CQ;
+        } else {
+            C->tx_enable = false;                     /* 应答: 静默收听 */
+            C->tx.type   = FT8_APP_MSG_CQ;
+        }
+        return;
+    }
+
+    C->tx_enable = true;
+    strncpy(C->tx.call_to, c->peer, sizeof(C->tx.call_to) - 1);
+    C->tx.call_to[sizeof(C->tx.call_to) - 1] = '\0';
+
+    switch (c->state) {
+    case QSO_ST_REPORT: C->tx.type = FT8_APP_MSG_REPORT;  C->tx.rst_db = c->my_rst;   break;
+    case QSO_ST_RR73:   C->tx.type = FT8_APP_MSG_RR73;                                break;
+    case QSO_ST_CALL:   C->tx.type = FT8_APP_MSG_CALL;                                break;
+    case QSO_ST_RRPT:   C->tx.type = FT8_APP_MSG_R_REPORT; C->tx.rst_db = c->peer_rst; break;
+    case QSO_ST_73:     C->tx.type = FT8_APP_MSG_73;                                  break;
+    default: break;
+    }
+}
+
+/* 由本机测得 SNR 折算我方发出的报告 dB */
+static int qso_snr_to_db(float snr_db)
+{
+    if (!isfinite(snr_db)) return -12;
+    int db = (int)lroundf(snr_db);
+    if (db < -30) db = -30;
+    if (db > 30)  db = 30;
+    return db;
+}
+
+static const char *qso_state_name(qso_state_t s)
+{
+    switch (s) {
+    case QSO_ST_IDLE:   return "空闲";
+    case QSO_ST_REPORT: return "等R报告";
+    case QSO_ST_RR73:   return "等73";
+    case QSO_ST_CALL:   return "呼叫中";
+    case QSO_ST_RRPT:   return "等RR73";
+    case QSO_ST_73:     return "收尾";
+    default:            return "?";
+    }
+}
+
+static void qso_to_idle(qso_ctx_t *c)
+{
+    c->state     = QSO_ST_IDLE;
+    c->engaged   = false;
+    c->peer[0]   = '\0';
+    c->attempts  = 0;
+    qso_apply(c);
+}
+
+/* 通联完成: 记日志、写"已完成"去重表、回空闲 */
+static void qso_complete(qso_ctx_t *c, int64_t now_slot)
+{
+    char t[24], line[192];
+    qso_time_str(t, sizeof(t));
+    snprintf(line, sizeof(line), "[%s] QSO 完成: %s %s  我发%+ddB / 收%+ddB  相位%d",
+             t, c->peer, c->peer_grid[0] ? c->peer_grid : "-", c->my_rst, c->peer_rst,
+             c->tx_parity);
+    qso_log_raw(line);
+    qso_note(c->peer, now_slot, true);
+    qso_to_idle(c);
+}
+
+/* 放弃当前台: 记日志、写"暂避"去重表、回空闲 */
+static void qso_give_up(qso_ctx_t *c, int64_t now_slot, int stage_attempts)
+{
+    char t[24], line[192];
+    qso_time_str(t, sizeof(t));
+    snprintf(line, sizeof(line), "[%s] 放弃 %s(阶段%s, 我方已发%u次)", t, c->peer,
+             qso_state_name(c->state), (unsigned)stage_attempts);
+    qso_log_raw(line);
+    qso_note(c->peer, now_slot, false);
+    qso_to_idle(c);
+}
+
+/* 消息语义解析(按发射方视角: call_de 恒为发射方) */
+static void qso_evt_classify(const qso_rx_t *m, qso_evt_t *e)
+{
+    const char *our = s_cfg.callsign;
+    memset(e, 0, sizeof(*e));
+    e->kind = QSO_EVT_NONE;
+
+    if (m->call_de[0] == '\0' || strchr(m->call_de, '<')) return;   /* 哈希呼号无法识别 */
+    if (strcmp(m->call_de, our) == 0) return;                        /* 本机自己的发射(被监听回收) */
+
+    strncpy(e->sender, m->call_de, sizeof(e->sender) - 1);
+    e->sender[sizeof(e->sender) - 1] = '\0';
+    e->parity = (int)(m->slot & 1);
+
+    const bool to_us = (strcmp(m->call_to, our) == 0);
+    const char *ex = m->extra;
+
+    if (!to_us) {
+        /* 不是点我: 只有 CQ/QRZ 呼叫才与本站相关(可应答) */
+        if (strncmp(m->call_to, "CQ", 2) == 0 || strcmp(m->call_to, "QRZ") == 0) {
+            e->kind = QSO_EVT_CQ;
+            if (str_is_gridish(ex)) strncpy(e->grid, ex, sizeof(e->grid) - 1);
+        }
+        return;
+    }
+
+    switch (m->ftypes[2]) {
+    case FTX_FIELD_GRID:                     /* 点我 + 网格 = 回答我的 CQ */
+        e->kind = QSO_EVT_ANSWER;
+        if (str_is_gridish(ex)) strncpy(e->grid, ex, sizeof(e->grid) - 1);
+        break;
+    case FTX_FIELD_RST:
+        e->rst_db = qso_db_parse(ex);
+        e->kind = (ex[0] == 'R') ? QSO_EVT_RREPORT : QSO_EVT_REPORT;
+        break;
+    case FTX_FIELD_TOKEN:
+        if (strcmp(ex, "RRR") == 0)      e->kind = QSO_EVT_RRR;
+        else if (strcmp(ex, "RR73") == 0) e->kind = QSO_EVT_RR73;
+        else if (strcmp(ex, "73") == 0)  e->kind = QSO_EVT_73;
+        break;
+    default:
+        break;
+    }
+}
+
+/* 收到一条结构化消息 -> 状态推进 */
+static void qso_on_rx(qso_ctx_t *c, const qso_rx_t *m)
+{
+    qso_evt_t ev;
+    qso_evt_classify(m, &ev);
+    if (ev.kind == QSO_EVT_NONE) return;
+
+    const int64_t now_slot = qso_now_slot();
+    char t[24], line[192];
+    qso_time_str(t, sizeof(t));
+
+    /* ---------------- 空闲 ---------------- */
+    if (!c->engaged) {
+        if (!s_cfg.qso.cq_mode) {
+            /* 应答模式: 听到陌生 CQ 即应答 */
+            if (ev.kind != QSO_EVT_CQ) return;
+            if (qso_blocked(ev.sender, now_slot)) return;
+            if (s_cfg.qso.target_callsign[0] &&
+                strcmp(ev.sender, s_cfg.qso.target_callsign) != 0) return;
+
+            c->state      = QSO_ST_CALL;
+            c->engaged    = true;
+            strncpy(c->peer, ev.sender, sizeof(c->peer) - 1);
+            c->peer[sizeof(c->peer) - 1] = '\0';
+            strncpy(c->peer_grid, ev.grid, sizeof(c->peer_grid) - 1);
+            c->peer_grid[sizeof(c->peer_grid) - 1] = '\0';
+            c->tx_parity  = ev.parity ^ 1;              /* 对方反相时隙发射 */
+            c->attempts   = 0;
+            c->last_counted = -1;
+            qso_apply(c);
+            snprintf(line, sizeof(line), "[%s] -> 呼叫 %s %s(改发相位%d)",
+                     t, c->peer, c->peer_grid, c->tx_parity);
+            qso_log_raw(line);
+        } else {
+            /* 主叫模式: 等"回答我 CQ"的台(点我呼号 + 网格) */
+            if (ev.kind != QSO_EVT_ANSWER) return;
+            if (qso_blocked(ev.sender, now_slot)) return;
+
+            c->state      = QSO_ST_REPORT;
+            c->engaged    = true;
+            strncpy(c->peer, ev.sender, sizeof(c->peer) - 1);
+            c->peer[sizeof(c->peer) - 1] = '\0';
+            strncpy(c->peer_grid, ev.grid, sizeof(c->peer_grid) - 1);
+            c->peer_grid[sizeof(c->peer_grid) - 1] = '\0';
+            c->my_rst     = qso_snr_to_db(m->snr_db);
+            c->tx_parity  = s_cfg.tx_slot_parity & 1;
+            c->attempts   = 0;
+            c->last_counted = -1;
+            qso_apply(c);
+            snprintf(line, sizeof(line), "[%s] %s 回答我的 CQ, 发报告 %+ddB",
+                     t, c->peer, c->my_rst);
+            qso_log_raw(line);
+        }
+        return;
+    }
+
+    /* ---------------- 进行中: 只处理来自当前 peer 的消息 ---------------- */
+    if (strcmp(ev.sender, c->peer) != 0) return;
+
+    /* 对方每次发射都重申我方相位为对方反相(抗 GPS 中途锁相导致的相位翻转) */
+    {
+        int want = ev.parity ^ 1;
+        if (want != c->tx_parity) {
+            c->tx_parity = want;
+            qso_apply(c);
+        }
+    }
+
+    switch (c->state) {
+    case QSO_ST_REPORT:                       /* 主叫: 等对方 R 报告 / 结束 */
+        if (ev.kind == QSO_EVT_REPORT || ev.kind == QSO_EVT_RREPORT) {
+            c->peer_rst = ev.rst_db;
+            c->state    = QSO_ST_RR73;
+            c->attempts = 0;
+            c->last_counted = -1;
+            qso_apply(c);
+            snprintf(line, sizeof(line), "[%s] 收到 %s 的%s报告 %+ddB, 发 RR73",
+                     t, c->peer, (ev.kind == QSO_EVT_RREPORT) ? "R" : "", c->peer_rst);
+            qso_log_raw(line);
+        } else if (ev.kind == QSO_EVT_RRR || ev.kind == QSO_EVT_RR73 || ev.kind == QSO_EVT_73) {
+            qso_complete(c, now_slot);
+        }
+        break;
+
+    case QSO_ST_RR73:                         /* 主叫: 等对方 73 结束 */
+        if (ev.kind == QSO_EVT_RRR || ev.kind == QSO_EVT_RR73 || ev.kind == QSO_EVT_73)
+            qso_complete(c, now_slot);
+        break;
+
+    case QSO_ST_CALL:                         /* 应答: 等对方 REPORT */
+        if (ev.kind == QSO_EVT_REPORT || ev.kind == QSO_EVT_RREPORT) {
+            c->peer_rst = ev.rst_db;
+            c->state    = QSO_ST_RRPT;
+            c->attempts = 0;
+            c->last_counted = -1;
+            qso_apply(c);
+            snprintf(line, sizeof(line), "[%s] 收到 %s 报告 %+ddB, 回 R 报告", t, c->peer, c->peer_rst);
+            qso_log_raw(line);
+        }
+        break;
+
+    case QSO_ST_RRPT:                         /* 应答: 等对方 RR73/RRR */
+        if (ev.kind == QSO_EVT_RRR || ev.kind == QSO_EVT_RR73) {
+            c->state    = QSO_ST_73;
+            c->attempts = 0;
+            c->last_counted = -1;
+            qso_apply(c);
+            snprintf(line, sizeof(line), "[%s] %s 收尾, 发 73", t, c->peer);
+            qso_log_raw(line);
+        } else if (ev.kind == QSO_EVT_73) {
+            qso_complete(c, now_slot);
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+/* 引擎任务 */
+static void ft8_qso_task(void *arg)
+{
+    (void)arg;
+    qso_ctx_t c;
+    memset(&c, 0, sizeof(c));
+    c.state      = QSO_ST_IDLE;
+    c.tx_parity  = s_cfg.tx_slot_parity & 1;
+    c.last_counted = -1;
+
+    if (s_cfg.qso.cq_mode) {
+        qso_apply(&c);
+        qso_log_raw("[QSO] 自动引擎启动: 主叫模式(自动 CQ, 完成 QSO 后自动收下一个)");
+    } else {
+        qso_apply(&c);
+        qso_log_raw("[QSO] 自动引擎启动: 应答模式(自动应答解码到的陌生 CQ 台)");
+    }
+
+    for (;;) {
+        qso_rx_t m;
+        while (xQueueReceive(s_qso_q, &m, 0) == pdTRUE)
+            qso_on_rx(&c, &m);
+
+        /* 我方发射时隙节流: 计重发次数; ST_73 发完即完成 */
+        if (c.engaged) {
+            const int64_t slot = qso_now_slot();
+            if ((slot & 1) == c.tx_parity && slot != c.last_counted) {
+                c.last_counted = slot;
+                c.attempts++;
+                if (c.state == QSO_ST_73) {
+                    qso_complete(&c, slot);
+                } else if (s_cfg.qso.max_retries > 0 && c.attempts >= s_cfg.qso.max_retries) {
+                    qso_give_up(&c, slot, c.attempts);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+}
+
+/* ============================================================
  * 对外接口
  * ============================================================ */
 void ft8_app_config_default(ft8_app_config_t *cfg)
@@ -725,6 +1405,7 @@ void ft8_app_config_default(ft8_app_config_t *cfg)
     cfg->tx_enable       = true;
     cfg->rx_enable       = true;
     cfg->utc_enable      = true;
+    cfg->gps_use_pps     = true;
     cfg->tx_slot_parity  = 0;
     cfg->tx_delay_ms     = 0;
     snprintf(cfg->callsign, sizeof(cfg->callsign), "BG7ABC");
@@ -755,6 +1436,12 @@ void ft8_app_config_default(ft8_app_config_t *cfg)
     cfg->rx_freq_osr      = 2;
     cfg->max_candidates   = 60;  /*每时隙解码耗时 ≈ 候选数(max_candidates) × 每个候选迭代数(ldpc_iterations) × 单次迭代成本*/
     cfg->ldpc_iterations  = 25;
+
+    /* 自动 QSO 引擎默认: 关闭(保持原有手动 cfg.tx 行为), 主叫模式 */
+    cfg->qso.enable           = false;      // 启用自动 QSO 引擎(启用才建队, RX 解码无队时不产生额外开销)
+    cfg->qso.cq_mode          = true;       // 主叫模式: 自动 CQ, 完成 QSO 后自动收下一个
+    cfg->qso.max_retries      = 4;          // 超过此次数仍无进展则放弃该台
+    cfg->qso.target_callsign[0] = '\0';     // 应答模式: 只应答此呼号, 空则应答所有陌生 CQ 台
 }
 
 esp_err_t ft8_app_start(const ft8_app_config_t *cfg)
@@ -784,11 +1471,30 @@ esp_err_t ft8_app_start(const ft8_app_config_t *cfg)
     ESP_ERROR_CHECK(wm8978_i2s_start_rx());
     ESP_ERROR_CHECK(wm8978_i2s_start_tx());
 
+    s_utc_ok = false;
     if (s_cfg.utc_enable) {
-        s_utc_ok = (time(NULL) > SNTP_EPOCH_MIN);
-        ESP_LOGW(TAG, "utc_enable: 系统时间%s校准；栅格严格对齐按本地 esp_timer，"
-                 "UTC 亚秒相位需额外接入毫秒级墙钟",
-                 s_utc_ok ? "已" : "未");
+        if (s_cfg.gps_utc_enable) {
+            /* 选用 GPS UTC：任务会在 cfg.gps 有效且收到 PPS 后自动锁存相位并
+             * 把 RX/TX 时隙栅格对齐到 UTC(:00/:15/:30/:45) */
+            utc_try_lock_gps();
+            ESP_LOGW(TAG, "utc_enable(gps): 等待 GPS UTC+PPS(%s)，就绪后自动对齐 UTC 栅格",
+                     s_utc_ok ? "已就绪" : "未就绪");
+        } else {
+            s_utc_ok = (time(NULL) > SNTP_EPOCH_MIN);
+            ESP_LOGW(TAG, "utc_enable(SNTP): 系统时间%s校准(仅显示用，UTC 栅格对齐请改用 GPS PPS)",
+                     s_utc_ok ? "已" : "未");
+        }
+    }
+
+    /* 自动 QSO 引擎(启用才建队, RX 解码无队时不产生额外开销) */
+    if (s_cfg.qso.enable) {
+        if (s_qso_q == NULL)
+            s_qso_q = xQueueCreate(QSO_QUEUE_LEN, sizeof(qso_rx_t));
+        if (xTaskCreatePinnedToCore(ft8_qso_task, "ft8_qso", 4096, NULL, 4, NULL, 0)
+                != pdPASS) {
+            ESP_LOGE(TAG, "ft8_qso 任务创建失败, 自动 QSO 引擎不可用");
+            if (s_qso_q) { vQueueDelete(s_qso_q); s_qso_q = NULL; }
+        }
     }
 
     xTaskCreatePinnedToCore(ft8_rx_task, "ft8_rx", STACK_RX, NULL, 6, &s_task_rx, 1);

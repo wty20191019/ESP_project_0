@@ -24,6 +24,10 @@
 
 #define TAG "main"
 
+/* FT8 应用全局配置：以引用交给 ft8_app(需保持有效)；
+ * 下面 gps_time_task 会持续把 GPS UTC 时间/日期/PPS 填入 cfg.gps */
+static ft8_app_config_t cfg;
+
 /* 屏幕显示本地时间所用时区(北京 = UTC+8)。UTC 直接显示可改为 0 */
 #define LCD_TZ_HOUR    8
 #define LCD_ROW_H      16                  /* 8x16 ASCII 行高 */
@@ -242,8 +246,142 @@ static void draw_page_signal(gps_info_t g)
     lcd_row(8, WHITE, "spd%0.1f crs%0.1f", g.speed_kmh, g.course_deg);
 }
 
+/* ================= 瀑布页(页 3) ================= */
+
+/* ===== 瀑布伪彩: 256 级 LUT(结点间线性插值), 输入是逐帧归一化后的 0..255 强度 ===== */
+typedef struct {
+    uint8_t v;          /* 色标位置(归一化 0..255) */
+    uint8_t r, g, b;    /* 该点颜色(8bit/通道) */
+} wf_stop_t;
+
+static const wf_stop_t s_wf_stops[] = {
+    {   0,   8,   0,  30 },   /* 近黑(噪声底) */
+    {  70,   0,   0, 220 },   /* 深蓝 */
+    { 110,   0,  60, 255 },   /* 蓝 */
+    { 150,   0, 235, 255 },   /* 青 */
+    { 185,  30, 255,  60 },   /* 绿 */
+    { 215, 255, 255,  30 },   /* 黄 */
+    { 240, 255,  90,   0 },   /* 橙 */
+    { 255, 255, 255, 255 },   /* 白(顶) */
+};
+
+static uint16_t s_wf_lut[256];
+static bool s_wf_lut_ok = false;
+
+static inline uint16_t wf_rgb565(int r, int g, int b)
+{
+    if (r < 0) r = 0;
+    if (r > 255) r = 255;
+    if (g < 0) g = 0;
+    if (g > 255) g = 255;
+    if (b < 0) b = 0;
+    if (b > 255) b = 255;
+    return (uint16_t)(((uint16_t)(r >> 3) << 11) | ((uint16_t)(g >> 2) << 5) | (uint16_t)(b >> 3));
+}
+
+static void wf_lut_build(void)
+{
+    const int N = (int)(sizeof(s_wf_stops) / sizeof(s_wf_stops[0]));
+    for (int v = 0; v < 256; v++)
+        s_wf_lut[v] = 0;                                  /* 先全黑(含噪声底) */
+
+    for (int i = 0; i < N - 1; i++) {
+        int v0 = s_wf_stops[i].v;
+        int v1 = s_wf_stops[i + 1].v;
+        for (int v = v0; v < v1 && v < 256; v++) {
+            float t = (float)(v - v0) / (float)(v1 - v0);
+            int r = s_wf_stops[i].r + (int)(t * (s_wf_stops[i + 1].r - s_wf_stops[i].r));
+            int g = s_wf_stops[i].g + (int)(t * (s_wf_stops[i + 1].g - s_wf_stops[i].g));
+            int b = s_wf_stops[i].b + (int)(t * (s_wf_stops[i + 1].b - s_wf_stops[i].b));
+            s_wf_lut[v] = wf_rgb565(r, g, b);
+        }
+    }
+    s_wf_lut[s_wf_stops[N - 1].v] = wf_rgb565(s_wf_stops[N - 1].r, s_wf_stops[N - 1].g, s_wf_stops[N - 1].b);
+    s_wf_lut_ok = true;
+}
+
+/* 归一化强度(0..255) -> RGB565(平滑渐变) */
+static uint16_t wf_color(uint8_t rel)
+{
+    if (!s_wf_lut_ok) wf_lut_build();
+    return s_wf_lut[rel];
+}
+
+/* 第 3 页: 瀑布图。最新一行贴屏幕底部, 历史向上滚动。
+ * 数据源: ft8_app RX 任务每收到一个符号块, 就把该块功率谱压缩成一行
+ * 128 点写入环形快照(见 ft8_app.h 的 ft8_wf_snap_t / ft8_wf_snap)。 */
+static void draw_page_fft(void)
+{
+    char buf[40];
+    snprintf(buf, sizeof(buf), "WF %.3g-%.3gk",
+             (double)cfg.rx_f_min / 1000.0, (double)cfg.rx_f_max / 1000.0);
+    lcd_row(0, CYAN, "%s", buf);
+
+    const ft8_wf_snap_t *wf = ft8_wf_snap();
+    if (wf == NULL || wf->seq == 0) {
+        lcd_row(4, GRAY, "NO DATA");
+        lcd_row(5, GRAY, "wait rx...");
+        return;
+    }
+
+    const uint32_t seq = wf->seq;              /* 一次性读取, 容忍极轻微跨核竞态 */
+    const uint32_t put = wf->put;
+    uint32_t n = (seq < FT8_WF_ROWS) ? seq : FT8_WF_ROWS;
+    uint32_t oldest = ((put - n) % FT8_WF_ROWS + FT8_WF_ROWS) % FT8_WF_ROWS;
+
+    /* ---- 第一遍: 直方图, 定"噪声底"(中位数 lo)与"顶"(最大值 hi) ----
+     * 逐帧自适应拉伸, 避免绝对阈值把整屏压在蓝/青段而没有其它颜色。 */
+    uint16_t hist[256] = { 0 };
+    for (uint32_t k = 0; k < n; k++) {
+        const uint8_t *row = wf->rows[(oldest + k) % FT8_WF_ROWS];
+        for (int x = 0; x < FT8_WF_COLS; x++)
+            hist[row[x]]++;
+    }
+    const uint32_t total = n * FT8_WF_COLS;
+
+    int acc = 0, lo = 0;
+    for (int i = 0; i < 256; i++) {
+        acc += hist[i];
+        if (acc * 2 >= (int)total) { lo = i; break; }
+    }
+    int hi = 0;
+    for (int i = 255; i >= 0; i--) {
+        if (hist[i]) { hi = i; break; }
+    }
+    int span = hi - lo;
+    if (span < 24) span = 24;               /* 纯噪声时也别让颜色乱跳 */
+
+    /* 本帧: 幅度字节 -> 归一化强度 -> 颜色(整帧用同一映射, 画面才稳定) */
+    uint16_t cmap[256];
+    for (int i = 0; i < 256; i++) {
+        int rel = (int)(((int64_t)i - lo) * 256 / span);
+        if (rel < 0) rel = 0;
+        if (rel > 255) rel = 255;
+        cmap[i] = wf_color((uint8_t)rel);
+    }
+
+    /* ---- 第二遍: 逐行按颜色游程水平填充, 减少绘图调用 ----
+     * 最新一行贴屏幕底部, 历史向上滚动。 */
+    for (uint32_t k = 0; k < n; k++) {
+        const uint8_t *row = wf->rows[(oldest + k) % FT8_WF_ROWS];
+        int y = LCD_H - 1 - (int)(n - 1 - k);
+
+        int x0 = 0;
+        uint16_t cur = cmap[row[0]];
+        for (int x = 1; x <= FT8_WF_COLS; x++) {
+            uint16_t c = (x < FT8_WF_COLS) ? cmap[row[x]] : (uint16_t)(cur ^ 0x100);
+            if (c != cur) {
+                if (cur != BLACK && x > x0)          /* 底色由 LCD_Clear 负责, 黑段可跳过 */
+                    LCD_Fill((uint16_t)x0, (uint16_t)y, (uint16_t)x, (uint16_t)(y + 1), cur);
+                x0 = x;
+                cur = c;
+            }
+        }
+    }
+}
+
 /* ================= LCD 主任务 ================= */
-#define LCD_PAGE_NUM    3                  /* 页数: 0=信息 1=卫星 2=信号 */
+#define LCD_PAGE_NUM    4                  /* 页数: 0=信息 1=卫星 2=信号 3=瀑布 */
 static volatile int s_lcd_page = 0;        /* 当前显示页, 由按键回调修改 */
 
 static void LCD_task(void *arg)
@@ -268,6 +406,7 @@ static void LCD_task(void *arg)
         if (page == 0)      draw_page_info(&g);
         else if (page == 1) draw_page_sat(&g);
         else if (page == 2) draw_page_signal(g);
+        else if (page == 3) draw_page_fft();
 
         LCD_Flush();                       /* 画完一整帧后一次性推送 */
 
@@ -297,6 +436,47 @@ static void rgb_led_task(void *arg)
         /* 蓝色呼吸 */
         for (int i = 0; i <= 255; i += 5) { led_set_rgb(0, 0, i); vTaskDelay(pdMS_TO_TICKS(5)); }
         for (int i = 255; i > 0; i -= 5)  { led_set_rgb(0, 0, i); vTaskDelay(pdMS_TO_TICKS(5)); }
+    }
+}
+
+/* ================= GPS UTC 时间 -> ft8_app 配置 =================
+ * GPS 模块自身已有后台 NMEA 解析任务(见 components/BSP/GPS)，这里只是把
+ * gps_get_info() 快照里的 UTC 时间/日期/PPS 拷贝进全局 cfg.gps，
+ * 供 ft8_app 在启用 gps_utc_enable 时做 UTC 时隙对齐。 */
+static void gps_time_task(void *arg)
+{
+    bool reported = false;
+    for (;;)
+    {
+        gps_info_t g;
+        gps_get_info(&g);
+
+        if (g.time_valid && g.date_valid)
+        {
+            cfg.gps.valid       = true;
+            cfg.gps.year        = g.year;
+            cfg.gps.month       = g.month;
+            cfg.gps.day         = g.day;
+            cfg.gps.hour        = g.hour;
+            cfg.gps.minute      = g.minute;
+            cfg.gps.second      = g.second;
+            cfg.gps.millisecond = g.millisecond;
+            cfg.gps.pps_seq     = g.pps_seq;          /* 没接 PPS 时为 0 */
+            cfg.gps.pps_edge_us = g.pps_edge_us;
+            if (!reported)
+            {
+                ESP_LOGI(TAG, "GPS UTC 就绪: %04u-%02u-%02u %02u:%02u:%02u.%03u PPS#%s",
+                         g.year, g.month, g.day, g.hour, g.minute, g.second,
+                         (unsigned)g.millisecond,
+                         g.pps_seq ? "有" : "无");
+                reported = true;
+            }
+        }
+        else
+        {
+            reported = false;   /* 失锁后再定位时重新上报 */
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
     }
 }
 
@@ -335,15 +515,17 @@ static void my_key_callback(key_id_t key_id, key_event_t event, void *user_data)
 void app_main(void)
 {
     key_init(my_key_callback, NULL);
+    gps_init();                       /* 启动 GPS NMEA/PPS 后台(幂等) */
 
     /* ====== FT8/FT4 配置示例 ====== */
-    static ft8_app_config_t cfg;    /* 必须保持有效：ft8_app 以引用方式使用它，运行中可直接改 */
     ft8_app_config_default(&cfg);
 
     cfg.protocol            = FTX_PROTOCOL_FT8;             /* FTX_PROTOCOL_FT4 切到 FT4(7.5s 时隙) */
     cfg.tx_enable           = true;                         /* 参与发射(仅在选中奇偶时隙) */
     cfg.rx_enable           = true;                         /* 持续解码 */
-    cfg.utc_enable          = true;                         /* 时隙对齐 UTC(:00/:15/:30/:45)，需先 SNTP 校时 */
+    cfg.utc_enable          = true;                         /* 总开关：按 UTC 对齐时隙 */
+    cfg.gps_utc_enable      = true;                         /* 选择使用 GPS 的 UTC 时间/日期对齐 */
+    cfg.gps_use_pps         = false;                        /* true=用 PPS 精对齐; false=不用PPS, NMEA粗对齐 */
     cfg.tx_slot_parity      = 0;                            /* 0=偶时隙发 / 1=奇时隙发，自动与对端交替 */
     cfg.tx_delay_ms         = 500;                          /* 本台时隙内再延时发射 */
     cfg.rx_parse_ms         = 100;                          /* 每个时隙结束前静默期(ms)，用于整窗解析 */    
@@ -362,10 +544,23 @@ void app_main(void)
 
     /* WM8978 编解码器参数(对应原硬编码的 ADDA(1,1)/Input(1,1,0)/MIC40/Output(1,0)/I2S(2,0)/HP(50,50)/SPK40，
      * 默认已一致，这里仅示例按需修改) */
-    cfg.codec.mic_gain = 40; // MIC 增益 0~63(-12~+35.25dB，0.75dB/步)
-    cfg.codec.hp_vol_l = 50; // L声道耳机音量 (0~63)
-    cfg.codec.hp_vol_r = 50; // R声道耳机音量 (0~63)
-    cfg.codec.spk_vol  = 40; // 音响音量 (0~63)
+    cfg.codec.mic_gain = 40;                        // MIC 增益 0~63(-12~+35.25dB，0.75dB/步)
+    cfg.codec.hp_vol_l = 50;                        // L声道耳机音量 (0~63)
+    cfg.codec.hp_vol_r = cfg.codec.hp_vol_l;        // R声道耳机音量 (0~63)
+    cfg.codec.spk_vol  = 0;                         // 音响音量 (0~63)
+
+    cfg.qso.enable           = true ;      // 启用自动 QSO 引擎(启用才建队, RX 解码无队时不产生额外开销)
+    cfg.qso.cq_mode          = true ;      // 主叫模式: 自动 CQ, 完成 QSO 后自动收下一个
+    cfg.qso.max_retries      = 4;          // 超过此次数仍无进展则放弃该台
+    cfg.qso.target_callsign[0] = '\0';     // 应答模式: 只应答此呼号, 空则应答所有陌生 CQ 台
+
+    //true 
+    //false
+
+    //启动任务============================================================================================
+    /* 搬运 GPS UTC 时间/日期/PPS 进 cfg.gps(供 ft8_app UTC 对齐，先启动让它尽早喂数据) */
+    xTaskCreatePinnedToCore(gps_time_task, "gps_utc", 4096, NULL, 5, NULL, 1);
+
     if (ft8_app_start(&cfg) != ESP_OK)
     {
         ESP_LOGE(TAG, "ft8_app 启动失败");
@@ -379,4 +574,6 @@ void app_main(void)
 
     xTaskCreatePinnedToCore(LCD_task, "LCD", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(rgb_led_task, "rgb_led", 2048, NULL, 1, NULL, 0);
+
+
 }

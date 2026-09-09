@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 #include "ft8/constants.h"
+#include "ft8/message.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,9 +26,26 @@ extern "C" {
  *
  *   FT4 同理，只是时隙 7.5s、符号 0.048s(105 符号)。
  *
- *   要求：utc_enable=1 时系统时钟需已由 SNTP 校准(误差<1s)，否则自动
- *   回退到以上电时刻为起点的本地栅格(仅用于无网测试)。
+ *   要求：utc_enable=1 且 gps_utc_enable=1 时，时隙栅格用 GPS 的 UTC 时间
+ *   日期+PPS 上升沿对齐到 UTC(:00/:15/:30/:45)(由外部任务把 GPS 快照填入
+ *   cfg.gps)。未启用 GPS 或 GPS 未定位时回退到以上电时刻为起点的本地栅格。
  * ============================================================ */
+
+/* ---- 瀑布显示快照(由 RX 任务每接收一个符号块追加一行, LCD 侧只读绘制) ---- */
+#define FT8_WF_COLS  128      /* 每行像素宽度(全屏 128) */
+#define FT8_WF_ROWS  128      /* 保留的历史行数(最新行在最下) */
+
+typedef struct {
+    volatile uint32_t seq;                    /* 每次追加一行 +1(判断是否更新) */
+    volatile uint32_t put;                    /* 下一行写入下标; 最新行 = (put-1+ROWS)%ROWS */
+    uint8_t rows[FT8_WF_ROWS][FT8_WF_COLS];   /* 幅度 0..255(≈-120..0dB 缩放), 频率左低右高 */
+} ft8_wf_snap_t;
+
+/**
+ * @brief 取瀑布显示快照(环形, 无锁: 读取端可能看到一帧正在写入的行, 可接受)。
+ * @return 快照指针; 音频/缓冲未就绪时为 NULL。
+ */
+const ft8_wf_snap_t *ft8_wf_snap(void);
 
 /**
  * 发射消息类型：标准一次通联的 6 类内容。
@@ -73,6 +91,95 @@ typedef struct {
     uint8_t spk_vol;     /*!< 喇叭音量 0~63(0 静音)，WM8978_SPKvol_Set */
 } ft8_app_codec_cfg_t;
 
+/** GPS UTC 时间/日期与 PPS(由外部任务从 gps 快照填充，供 FT8 UTC 时隙对齐) */
+typedef struct {
+    bool     valid;          /*!< GPS UTC 时间+日期均有效 */
+    uint16_t year;           /*!< UTC 公元年，如 2026 */
+    uint8_t  month;          /*!< UTC 月 1~12 */
+    uint8_t  day;            /*!< UTC 日 1~31 */
+    uint8_t  hour;           /*!< UTC 时 0~23 */
+    uint8_t  minute;         /*!< UTC 分 0~59 */
+    uint8_t  second;         /*!< UTC 秒 0~59 */
+    uint16_t millisecond;    /*!< UTC 毫秒 0~999 */
+    uint32_t pps_seq;        /*!< GPS PPS 上升沿计数(>0 表示已收到秒脉冲) */
+    int64_t  pps_edge_us;    /*!< 最近一次 PPS 上升沿的 esp_timer 时刻(上电起 µs) */
+} ft8_app_gps_time_t;
+
+
+/* 结构化解码消息(RX 任务 -> 引擎队列) */
+typedef struct {
+    ftx_message_type_t msg_type;
+    char call_to[16];
+    char call_de[16];
+    char extra[12];
+    ftx_field_t ftypes[FTX_MAX_MESSAGE_FIELDS];
+    float freq_hz;
+    float snr_db;
+    int64_t slot;
+} qso_rx_t;
+
+/* 语义事件(已按"发射方视角"归一化) */
+typedef enum {
+    QSO_EVT_NONE,   /* 与本站无关 */
+    QSO_EVT_CQ,     /* 对方呼叫 CQ(可应答) */
+    QSO_EVT_ANSWER, /* 对方回答我方 CQ(点我方呼号 + 网格) */
+    QSO_EVT_REPORT, /* 对方发我方信号报告(不带 R) */
+    QSO_EVT_RREPORT,/* 对方发我方 R 报告 */
+    QSO_EVT_RRR,    /* 对方 RRR */
+    QSO_EVT_RR73,   /* 对方 RR73 */
+    QSO_EVT_73,     /* 对方 73 */
+} qso_evt_kind_t;
+
+typedef struct {
+    qso_evt_kind_t kind;
+    char sender[16];   /* 发射方呼号 */
+    char grid[8];      /* 网格(仅 CQ/ANSWER) */
+    int  rst_db;       /* 报告 dB(仅报告类) */
+    int  parity;       /* 收到该消息的时隙奇偶(= 对方发射相位) */
+} qso_evt_t;
+
+/* QSO 状态机阶段(每阶段对应一份我方要发的 cfg.tx 内容) */
+typedef enum {
+    QSO_ST_IDLE,        /* 空闲: 主叫模式=CQ, 应答模式=静默 */
+    QSO_ST_REPORT,      /* 主叫: 已发 REPORT, 等对方 R 报告/结束 */
+    QSO_ST_RR73,        /* 主叫: 已发 RR73, 等对方 73 */
+    QSO_ST_CALL,        /* 应答: 已发 CALL, 等对方 REPORT */
+    QSO_ST_RRPT,        /* 应答: 已发 R 报告, 等对方 RR73/RRR */
+    QSO_ST_73,          /* 应答: 已决定发 73, 发完即完成 */
+} qso_state_t;
+
+/* 引擎任务运行时上下文 */
+typedef struct {
+    qso_state_t state;
+    bool engaged;           /* 是否已锁定某台在通联中 */
+    char peer[16];
+    char peer_grid[8];
+    int  peer_rst;          /* 对方报告给我们的 dB */
+    int  my_rst;            /* 我方发出的 dB */
+    int  tx_parity;         /* 我方发射时隙奇偶 */
+    int  attempts;          /* 当前阶段我方已发射次数 */
+    int64_t last_counted;   /* 已计数的我方时隙号 */
+} qso_ctx_t;
+
+/* 最近记录的呼号(完成=永久; 放弃=暂避 SKIP_AGE_SLOTS 个时隙) */
+typedef struct {
+    char call[16];
+    int64_t slot;
+    bool worked;
+} qso_recent_t;
+
+
+/** 自动 QSO 引擎配置(仅 ft8_app_start 启动时生效, 运行中改动也会热生效)。
+ *  引擎启用后会"接管" cfg.tx / cfg.tx_enable / cfg.tx_slot_parity,
+ *  手动改 cfg.tx 的方式将不再生效(被引擎覆盖)。 */
+typedef struct {
+    bool enable;                /*!< 总开关: 是否启用自动 QSO 引擎 */
+    bool cq_mode;               /*!< true=主叫模式: 自动发 CQ 并等待/完成应答;
+                                 *     false=应答模式: 不主动发射, 解码到陌生 CQ 台后自动应答 */
+    int  max_retries;           /*!< 每个 QSO 阶段我方最多发射重试的次数(超出则放弃该台) */
+    char target_callsign[16];   /*!< 应答模式定向呼叫对象, 留空=自动选择解码到的 CQ 台 */
+} ft8_qso_config_t;
+
 /** FT8/FT4 应用配置结构体 */
 typedef struct {
     /* ---- 协议与开关 ---- */
@@ -81,8 +188,16 @@ typedef struct {
     bool rx_enable;             /*!< 是否持续接收解码 */
 
     /* ---- 时间(宏观层) ---- */
-    bool utc_enable;            /*!< 用系统 UTC 时间对齐 15s/7.5s 栅格(需先 SNTP 校时)；
-                                 *    为 false 或时间未校准时退回本地栅格 */
+    bool utc_enable;            /*!< 总开关：按 UTC 对齐 15s/7.5s 栅格；
+                                 *    为 false 或没有可用 UTC 时钟时退回本地栅格 */
+    bool gps_utc_enable;        /*!< 选择使用 GPS 的 UTC 时间/日期对齐时隙
+                                 *    (需 utc_enable=1，且 cfg.gps 时间日期有效)；
+                                 *    为 false 时退用系统 time()(SNTP/RTC) */
+    bool gps_use_pps;           /*!< 使用 GPS UTC 时是否依赖 PPS 秒脉冲：
+                                 *    true = 必须收到 PPS(gps.pps_seq>0)才做亚秒级精确锁相；
+                                 *    false = 不用 PPS，用 NMEA 串口 UTC 时间做粗对齐
+                                 *            (误差可达数百 ms~1s，仅适合无 PPS 场合) */
+    ft8_app_gps_time_t gps;     /*!< GPS UTC 时间/日期与 PPS(由外部任务持续更新) */
     int  tx_slot_parity;        /*!< 0=在偶数时隙发射(WSJT-X "even" 默认)；
                                  *    1=在奇数时隙发射，对端自动落在另一奇偶 */
     uint32_t tx_delay_ms;       /*!< 本台时隙内再延时多少 ms 开始发射(0~时隙长-消息长) */
@@ -110,6 +225,8 @@ typedef struct {
     int ldpc_iterations;        /*!< LDPC 最大迭代次数 把瀑布幅度转成软比特，再用置信传播迭代解码 越多：纠错越强，弱/被干扰的信号越可能解出来，但每个候选的耗时近似成正比；越少：快但容易解不出弱台。 */
     uint32_t rx_parse_ms;       /*!< 每个时隙结束前提前多少 ms 停止接收并开始解析
                                  *    (下限 1500ms，默认 1500；过小会被钳到 1.5s 以免解码拖入下一时隙) */
+
+    ft8_qso_config_t qso;       /*!< 自动 QSO 引擎配置(enable=1 时引擎接管 cfg.tx) */
 
     uint8_t _reserved[8];
 } ft8_app_config_t;
