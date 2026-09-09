@@ -248,23 +248,21 @@ static void draw_page_signal(gps_info_t g)
 
 /* ================= 瀑布页(页 3) ================= */
 
-/* ===== 瀑布伪彩: 256 级 LUT, 在色标结点间线性插值(冷→热), 噪声底以下为黑 ===== */
-#define WF_NOISE_FLOOR   30     /* v<120(约 -60dB 以下)视为背景噪声 -> 黑 */
-
+/* ===== 瀑布伪彩: 256 级 LUT(结点间线性插值), 输入是逐帧归一化后的 0..255 强度 ===== */
 typedef struct {
-    uint8_t v;          /* 色标所在幅度 */
+    uint8_t v;          /* 色标位置(归一化 0..255) */
     uint8_t r, g, b;    /* 该点颜色(8bit/通道) */
 } wf_stop_t;
 
 static const wf_stop_t s_wf_stops[] = {
-    { WF_NOISE_FLOOR,   0,   0,  80 },   /* 黑蓝底 */
-    { 140,   0,  40, 255 },   /* 蓝 */
-    { 160,   0, 255, 255 },   /* 青 */
-    { 180,  40, 255,  20 },   /* 绿 */
-    { 200, 255, 255,  40 },   /* 黄 */
-    { 220, 255, 140,   0 },   /* 橙 */
-    { 240, 255,  30,   0 },   /* 红 */
-    { 255, 255, 255, 255 },   /* 白(削波) */
+    {   0,   8,   0,  30 },   /* 近黑(噪声底) */
+    {  70,   0,   0, 220 },   /* 深蓝 */
+    { 110,   0,  60, 255 },   /* 蓝 */
+    { 150,   0, 235, 255 },   /* 青 */
+    { 185,  30, 255,  60 },   /* 绿 */
+    { 215, 255, 255,  30 },   /* 黄 */
+    { 240, 255,  90,   0 },   /* 橙 */
+    { 255, 255, 255, 255 },   /* 白(顶) */
 };
 
 static uint16_t s_wf_lut[256];
@@ -302,11 +300,11 @@ static void wf_lut_build(void)
     s_wf_lut_ok = true;
 }
 
-/* 幅度字节(v 0..255, 大致对应 -120..0dB) -> RGB565(平滑渐变) */
-static uint16_t wf_color(uint8_t v)
+/* 归一化强度(0..255) -> RGB565(平滑渐变) */
+static uint16_t wf_color(uint8_t rel)
 {
     if (!s_wf_lut_ok) wf_lut_build();
-    return s_wf_lut[v];
+    return s_wf_lut[rel];
 }
 
 /* 第 3 页: 瀑布图。最新一行贴屏幕底部, 历史向上滚动。
@@ -331,15 +329,47 @@ static void draw_page_fft(void)
     uint32_t n = (seq < FT8_WF_ROWS) ? seq : FT8_WF_ROWS;
     uint32_t oldest = ((put - n) % FT8_WF_ROWS + FT8_WF_ROWS) % FT8_WF_ROWS;
 
-    /* 每一行对应一个符号时段; 逐行按颜色游程水平填充, 减少绘图调用 */
+    /* ---- 第一遍: 直方图, 定"噪声底"(中位数 lo)与"顶"(最大值 hi) ----
+     * 逐帧自适应拉伸, 避免绝对阈值把整屏压在蓝/青段而没有其它颜色。 */
+    uint16_t hist[256] = { 0 };
+    for (uint32_t k = 0; k < n; k++) {
+        const uint8_t *row = wf->rows[(oldest + k) % FT8_WF_ROWS];
+        for (int x = 0; x < FT8_WF_COLS; x++)
+            hist[row[x]]++;
+    }
+    const uint32_t total = n * FT8_WF_COLS;
+
+    int acc = 0, lo = 0;
+    for (int i = 0; i < 256; i++) {
+        acc += hist[i];
+        if (acc * 2 >= (int)total) { lo = i; break; }
+    }
+    int hi = 0;
+    for (int i = 255; i >= 0; i--) {
+        if (hist[i]) { hi = i; break; }
+    }
+    int span = hi - lo;
+    if (span < 24) span = 24;               /* 纯噪声时也别让颜色乱跳 */
+
+    /* 本帧: 幅度字节 -> 归一化强度 -> 颜色(整帧用同一映射, 画面才稳定) */
+    uint16_t cmap[256];
+    for (int i = 0; i < 256; i++) {
+        int rel = (int)(((int64_t)i - lo) * 256 / span);
+        if (rel < 0) rel = 0;
+        if (rel > 255) rel = 255;
+        cmap[i] = wf_color((uint8_t)rel);
+    }
+
+    /* ---- 第二遍: 逐行按颜色游程水平填充, 减少绘图调用 ----
+     * 最新一行贴屏幕底部, 历史向上滚动。 */
     for (uint32_t k = 0; k < n; k++) {
         const uint8_t *row = wf->rows[(oldest + k) % FT8_WF_ROWS];
         int y = LCD_H - 1 - (int)(n - 1 - k);
 
         int x0 = 0;
-        uint16_t cur = wf_color(row[0]);
+        uint16_t cur = cmap[row[0]];
         for (int x = 1; x <= FT8_WF_COLS; x++) {
-            uint16_t c = (x < FT8_WF_COLS) ? wf_color(row[x]) : (uint16_t)(cur ^ 0x100);
+            uint16_t c = (x < FT8_WF_COLS) ? cmap[row[x]] : (uint16_t)(cur ^ 0x100);
             if (c != cur) {
                 if (cur != BLACK && x > x0)          /* 底色由 LCD_Clear 负责, 黑段可跳过 */
                     LCD_Fill((uint16_t)x0, (uint16_t)y, (uint16_t)x, (uint16_t)(y + 1), cur);
