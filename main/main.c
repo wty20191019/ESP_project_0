@@ -415,6 +415,8 @@ void app_main(void)
     cfg.codec.spk_vol  = 40; // 音响音量 (0~63)
 
     
+
+    //启动任务============================================================================================
     /* 搬运 GPS UTC 时间/日期/PPS 进 cfg.gps(供 ft8_app UTC 对齐，先启动让它尽早喂数据) */
     xTaskCreatePinnedToCore(gps_time_task, "gps_utc", 4096, NULL, 5, NULL, 1);
 
@@ -431,4 +433,6 @@ void app_main(void)
 
     xTaskCreatePinnedToCore(LCD_task, "LCD", 4096, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(rgb_led_task, "rgb_led", 2048, NULL, 1, NULL, 0);
+
+
 }
