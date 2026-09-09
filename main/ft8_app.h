@@ -31,6 +31,22 @@ extern "C" {
  *   cfg.gps)。未启用 GPS 或 GPS 未定位时回退到以上电时刻为起点的本地栅格。
  * ============================================================ */
 
+/* ---- 瀑布显示快照(由 RX 任务每接收一个符号块追加一行, LCD 侧只读绘制) ---- */
+#define FT8_WF_COLS  128      /* 每行像素宽度(全屏 128) */
+#define FT8_WF_ROWS  128      /* 保留的历史行数(最新行在最下) */
+
+typedef struct {
+    volatile uint32_t seq;                    /* 每次追加一行 +1(判断是否更新) */
+    volatile uint32_t put;                    /* 下一行写入下标; 最新行 = (put-1+ROWS)%ROWS */
+    uint8_t rows[FT8_WF_ROWS][FT8_WF_COLS];   /* 幅度 0..255(≈-120..0dB 缩放), 频率左低右高 */
+} ft8_wf_snap_t;
+
+/**
+ * @brief 取瀑布显示快照(环形, 无锁: 读取端可能看到一帧正在写入的行, 可接受)。
+ * @return 快照指针; 音频/缓冲未就绪时为 NULL。
+ */
+const ft8_wf_snap_t *ft8_wf_snap(void);
+
 /**
  * 发射消息类型：标准一次通联的 6 类内容。
  * 文本一律以本机(呼号=callsign)为发送方视角拼接，格式为：

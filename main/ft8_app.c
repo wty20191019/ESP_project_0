@@ -637,6 +637,72 @@ static void rx_status_log(const monitor_t *mon, int64_t now_us, int64_t slot)
     }
 }
 
+/* ============================================================
+ * 瀑布显示快照(RX 每收到一个符号块, 压缩成一行功率谱, 供 LCD 绘制)
+ * 写入端: ft8_rx_task(core1); 读取端: LCD 任务(core0)。
+ * 无锁设计: 读端容忍看到一帧正在写入的行(写入 160ms 才一行, 风险可忽略)。
+ * ============================================================ */
+static ft8_wf_snap_t *s_wf = NULL;
+
+static void wf_snap_alloc(void)
+{
+    if (s_wf) return;
+    ft8_wf_snap_t *w = heap_caps_malloc(sizeof(*w), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (w == NULL) w = malloc(sizeof(*w));
+    if (w) {
+        memset(w, 0, sizeof(*w));
+        s_wf = w;
+    } else {
+        ESP_LOGE(TAG, "瀑布快照内存不足, 瀑布页将无数据");
+    }
+}
+
+/* 把 monitor 刚写完的符号块(num_blocks-1)压缩成一行 FT8_WF_COLS 点功率谱。
+ * mag 布局: [块][time_osr][freq_osr][num_bins], 值 0..255(≈-120..0dB)。 */
+static void wf_disp_add(const ftx_waterfall_t *wf)
+{
+    if (wf == NULL || wf->mag == NULL) return;
+    if (wf->num_blocks <= 0 || wf->num_blocks > wf->max_blocks) return;
+    if (wf->num_bins <= 0) return;
+
+    if (s_wf == NULL) wf_snap_alloc();
+    if (s_wf == NULL) return;
+
+    const int nb     = wf->num_bins;
+    const int stride = wf->block_stride;
+    const int t_osr  = wf->time_osr > 0 ? wf->time_osr : 1;
+    const int f_osr  = wf->freq_osr > 0 ? wf->freq_osr : 1;
+    const int os     = (wf->num_blocks - 1) * stride;   /* 最新块的起始 */
+
+    uint8_t *row = s_wf->rows[s_wf->put];
+    for (int c = 0; c < FT8_WF_COLS; c++) {
+        int lo = (c * nb) / FT8_WF_COLS;
+        int hi = ((c + 1) * nb) / FT8_WF_COLS;
+        if (hi <= lo) hi = lo + 1;
+        if (lo >= nb) { row[c] = 0; continue; }
+        if (hi > nb) hi = nb;
+
+        uint8_t mx = 0;
+        for (int b = lo; b < hi; b++) {                 /* 列内 bin(取峰值) */
+            for (int t = 0; t < t_osr; t++) {
+                int base = os + (t * f_osr) * nb;
+                for (int f = 0; f < f_osr; f++) {
+                    uint8_t v = wf->mag[base + f * nb + b];
+                    if (v > mx) mx = v;
+                }
+            }
+        }
+        row[c] = mx;
+    }
+    s_wf->put = (s_wf->put + 1) % FT8_WF_ROWS;
+    s_wf->seq++;
+}
+
+const ft8_wf_snap_t *ft8_wf_snap(void)
+{
+    return s_wf;
+}
+
 static void ft8_rx_task(void *arg)
 {
     (void)arg;
@@ -724,6 +790,7 @@ static void ft8_rx_task(void *arg)
             if (s_cfg.rx_enable) {
                 for (int i = 0; i < sym_samples; i++) fr[i] = (float)ablk[i * 2] * (1.0f / 32768.0f);
                 monitor_process(&mon, fr);
+                wf_disp_add(&mon.wf);      /* 新符号入瀑布, 供 LCD 页绘制 */
             }
             now = esp_timer_get_time();
             rx_status_log(&mon, now, slot_id);

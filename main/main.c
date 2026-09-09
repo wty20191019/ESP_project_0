@@ -246,8 +246,142 @@ static void draw_page_signal(gps_info_t g)
     lcd_row(8, WHITE, "spd%0.1f crs%0.1f", g.speed_kmh, g.course_deg);
 }
 
+/* ================= 瀑布页(页 3) ================= */
+
+/* ===== 瀑布伪彩: 256 级 LUT(结点间线性插值), 输入是逐帧归一化后的 0..255 强度 ===== */
+typedef struct {
+    uint8_t v;          /* 色标位置(归一化 0..255) */
+    uint8_t r, g, b;    /* 该点颜色(8bit/通道) */
+} wf_stop_t;
+
+static const wf_stop_t s_wf_stops[] = {
+    {   0,   8,   0,  30 },   /* 近黑(噪声底) */
+    {  70,   0,   0, 220 },   /* 深蓝 */
+    { 110,   0,  60, 255 },   /* 蓝 */
+    { 150,   0, 235, 255 },   /* 青 */
+    { 185,  30, 255,  60 },   /* 绿 */
+    { 215, 255, 255,  30 },   /* 黄 */
+    { 240, 255,  90,   0 },   /* 橙 */
+    { 255, 255, 255, 255 },   /* 白(顶) */
+};
+
+static uint16_t s_wf_lut[256];
+static bool s_wf_lut_ok = false;
+
+static inline uint16_t wf_rgb565(int r, int g, int b)
+{
+    if (r < 0) r = 0;
+    if (r > 255) r = 255;
+    if (g < 0) g = 0;
+    if (g > 255) g = 255;
+    if (b < 0) b = 0;
+    if (b > 255) b = 255;
+    return (uint16_t)(((uint16_t)(r >> 3) << 11) | ((uint16_t)(g >> 2) << 5) | (uint16_t)(b >> 3));
+}
+
+static void wf_lut_build(void)
+{
+    const int N = (int)(sizeof(s_wf_stops) / sizeof(s_wf_stops[0]));
+    for (int v = 0; v < 256; v++)
+        s_wf_lut[v] = 0;                                  /* 先全黑(含噪声底) */
+
+    for (int i = 0; i < N - 1; i++) {
+        int v0 = s_wf_stops[i].v;
+        int v1 = s_wf_stops[i + 1].v;
+        for (int v = v0; v < v1 && v < 256; v++) {
+            float t = (float)(v - v0) / (float)(v1 - v0);
+            int r = s_wf_stops[i].r + (int)(t * (s_wf_stops[i + 1].r - s_wf_stops[i].r));
+            int g = s_wf_stops[i].g + (int)(t * (s_wf_stops[i + 1].g - s_wf_stops[i].g));
+            int b = s_wf_stops[i].b + (int)(t * (s_wf_stops[i + 1].b - s_wf_stops[i].b));
+            s_wf_lut[v] = wf_rgb565(r, g, b);
+        }
+    }
+    s_wf_lut[s_wf_stops[N - 1].v] = wf_rgb565(s_wf_stops[N - 1].r, s_wf_stops[N - 1].g, s_wf_stops[N - 1].b);
+    s_wf_lut_ok = true;
+}
+
+/* 归一化强度(0..255) -> RGB565(平滑渐变) */
+static uint16_t wf_color(uint8_t rel)
+{
+    if (!s_wf_lut_ok) wf_lut_build();
+    return s_wf_lut[rel];
+}
+
+/* 第 3 页: 瀑布图。最新一行贴屏幕底部, 历史向上滚动。
+ * 数据源: ft8_app RX 任务每收到一个符号块, 就把该块功率谱压缩成一行
+ * 128 点写入环形快照(见 ft8_app.h 的 ft8_wf_snap_t / ft8_wf_snap)。 */
+static void draw_page_fft(void)
+{
+    char buf[40];
+    snprintf(buf, sizeof(buf), "WF %.3g-%.3gk",
+             (double)cfg.rx_f_min / 1000.0, (double)cfg.rx_f_max / 1000.0);
+    lcd_row(0, CYAN, "%s", buf);
+
+    const ft8_wf_snap_t *wf = ft8_wf_snap();
+    if (wf == NULL || wf->seq == 0) {
+        lcd_row(4, GRAY, "NO DATA");
+        lcd_row(5, GRAY, "wait rx...");
+        return;
+    }
+
+    const uint32_t seq = wf->seq;              /* 一次性读取, 容忍极轻微跨核竞态 */
+    const uint32_t put = wf->put;
+    uint32_t n = (seq < FT8_WF_ROWS) ? seq : FT8_WF_ROWS;
+    uint32_t oldest = ((put - n) % FT8_WF_ROWS + FT8_WF_ROWS) % FT8_WF_ROWS;
+
+    /* ---- 第一遍: 直方图, 定"噪声底"(中位数 lo)与"顶"(最大值 hi) ----
+     * 逐帧自适应拉伸, 避免绝对阈值把整屏压在蓝/青段而没有其它颜色。 */
+    uint16_t hist[256] = { 0 };
+    for (uint32_t k = 0; k < n; k++) {
+        const uint8_t *row = wf->rows[(oldest + k) % FT8_WF_ROWS];
+        for (int x = 0; x < FT8_WF_COLS; x++)
+            hist[row[x]]++;
+    }
+    const uint32_t total = n * FT8_WF_COLS;
+
+    int acc = 0, lo = 0;
+    for (int i = 0; i < 256; i++) {
+        acc += hist[i];
+        if (acc * 2 >= (int)total) { lo = i; break; }
+    }
+    int hi = 0;
+    for (int i = 255; i >= 0; i--) {
+        if (hist[i]) { hi = i; break; }
+    }
+    int span = hi - lo;
+    if (span < 24) span = 24;               /* 纯噪声时也别让颜色乱跳 */
+
+    /* 本帧: 幅度字节 -> 归一化强度 -> 颜色(整帧用同一映射, 画面才稳定) */
+    uint16_t cmap[256];
+    for (int i = 0; i < 256; i++) {
+        int rel = (int)(((int64_t)i - lo) * 256 / span);
+        if (rel < 0) rel = 0;
+        if (rel > 255) rel = 255;
+        cmap[i] = wf_color((uint8_t)rel);
+    }
+
+    /* ---- 第二遍: 逐行按颜色游程水平填充, 减少绘图调用 ----
+     * 最新一行贴屏幕底部, 历史向上滚动。 */
+    for (uint32_t k = 0; k < n; k++) {
+        const uint8_t *row = wf->rows[(oldest + k) % FT8_WF_ROWS];
+        int y = LCD_H - 1 - (int)(n - 1 - k);
+
+        int x0 = 0;
+        uint16_t cur = cmap[row[0]];
+        for (int x = 1; x <= FT8_WF_COLS; x++) {
+            uint16_t c = (x < FT8_WF_COLS) ? cmap[row[x]] : (uint16_t)(cur ^ 0x100);
+            if (c != cur) {
+                if (cur != BLACK && x > x0)          /* 底色由 LCD_Clear 负责, 黑段可跳过 */
+                    LCD_Fill((uint16_t)x0, (uint16_t)y, (uint16_t)x, (uint16_t)(y + 1), cur);
+                x0 = x;
+                cur = c;
+            }
+        }
+    }
+}
+
 /* ================= LCD 主任务 ================= */
-#define LCD_PAGE_NUM    3                  /* 页数: 0=信息 1=卫星 2=信号 */
+#define LCD_PAGE_NUM    4                  /* 页数: 0=信息 1=卫星 2=信号 3=瀑布 */
 static volatile int s_lcd_page = 0;        /* 当前显示页, 由按键回调修改 */
 
 static void LCD_task(void *arg)
@@ -272,6 +406,7 @@ static void LCD_task(void *arg)
         if (page == 0)      draw_page_info(&g);
         else if (page == 1) draw_page_sat(&g);
         else if (page == 2) draw_page_signal(g);
+        else if (page == 3) draw_page_fft();
 
         LCD_Flush();                       /* 画完一整帧后一次性推送 */
 
