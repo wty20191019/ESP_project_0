@@ -466,14 +466,14 @@ static float rx_measure_snr(const ftx_waterfall_t *wf, const ftx_candidate_t *ca
 {
     if (wf == NULL || wf->mag == NULL || cand == NULL || tones == NULL)
         return NAN;
-    if (n_tones < 2 || bin_bw_hz <= 0.0f || cand->time_offset < 0 || cand->freq_offset < 0)
+    if (n_tones < 2 || bin_bw_hz <= 0.0f || cand->freq_offset < 0)
         return NAN;
     if (cand->freq_offset + n_tones > wf->num_bins)
         return NAN;
 
-    int base = cand->time_offset;
-    base = (base * wf->time_osr + cand->time_sub) * wf->freq_osr + cand->freq_sub;
-    base = base * wf->num_bins + cand->freq_offset;
+    /* time_offset 允许为负: 消息起点可能早于本时隙采集窗口(前一两个符号溢出到
+     * 上一时隙)。这类符号没有数据, 下面按 block_abs 跳过; 只要窗内符号够多
+     * (n_sig>=4) 仍可估算, 不再因起点略早而整体放弃。 */
 
     double sum_sig = 0.0, sum_nse = 0.0;
     int n_sig = 0, n_nse = 0;
@@ -481,7 +481,12 @@ static float rx_measure_snr(const ftx_waterfall_t *wf, const ftx_candidate_t *ca
     for (int s = 0; s < n_syms; s++) {
         int block_abs = cand->time_offset + s;   /* 消息符号 s 对应的捕获块 */
         if (block_abs < 0 || block_abs >= wf->num_blocks) continue;
-        const WF_ELEM_T *p = wf->mag + base + (size_t)s * wf->block_stride;
+        /* 布局: mag[块][time_osr][freq_osr][num_bins]; 取该块子采样/频偏位置 */
+        int within = cand->time_sub * (wf->freq_osr * wf->num_bins) +
+                     cand->freq_sub * wf->num_bins + cand->freq_offset;
+        const WF_ELEM_T *p = wf->mag +
+                             (size_t)block_abs * (size_t)wf->block_stride +
+                             (size_t)within;
         int t = tones[s];                        /* 该符号实际发送的 tone 序号 */
         if (t < 0 || t >= n_tones) continue;
         sum_sig += WF_ELEM_MAG(p[t]);
