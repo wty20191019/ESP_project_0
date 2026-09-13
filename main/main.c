@@ -17,6 +17,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "ft8_app.h"
+#include "qso_log.h"
 #include "led.h"
 #include "lcd.h"
 #include "gps.h"
@@ -531,6 +532,8 @@ void app_main(void)
     cfg.rx_parse_ms         = 100;                          /* 每个时隙结束前静默期(ms)，用于整窗解析 */    
     snprintf(cfg.callsign, sizeof(cfg.callsign), "BG7ZJW"); // 本机呼号
     snprintf(cfg.grid,     sizeof(cfg.grid),     "JO70");   // 本机网格
+    snprintf(cfg.band,     sizeof(cfg.band),     "40m");    // QSO 日志用频段(设备无射频信息, 手动指定)
+    cfg.qso_freq_mhz        = 7.074000f;                    // QSO 日志用频率 MHz
     cfg.tx.type             = FT8_APP_MSG_CQ;               /* 第几类消息: CQ / CALL / REPORT / R_REPORT / RRR / RR73 / 73 */
     cfg.tx.cq_modifier[0]   = '\0';                         /* "DX"/"WW"/"TEST"... 仅 CQ 类用 */
     cfg.tx.call_to[0]       = '\0';                         /* 目标呼号(类型 2~6 用)，如 "BG5ABC" */
@@ -558,6 +561,11 @@ void app_main(void)
     //false
 
     //启动任务============================================================================================
+    /* QSO 日志: 注册回调并初始化 FAT 分区 + USB 大容量存储(U盘) */
+    ft8_app_set_qso_callback(qso_log_on_qso, NULL);
+    if (qso_log_init() != ESP_OK)
+        ESP_LOGW(TAG, "QSO 日志存储初始化失败(不影响收发)");
+
     /* 搬运 GPS UTC 时间/日期/PPS 进 cfg.gps(供 ft8_app UTC 对齐，先启动让它尽早喂数据) */
     xTaskCreatePinnedToCore(gps_time_task, "gps_utc", 4096, NULL, 5, NULL, 1);
 
