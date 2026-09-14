@@ -274,12 +274,9 @@ static int grid_distance_km(const char *g1, const char *g2)
     return (int)(R * c + 0.5);
 }
 
-/* ---------------- 初始化 ---------------- */
-esp_err_t qso_log_init(bool usb_mount)
+/* ---------------- 初始化(只挂载本地, 不启 USB) ---------------- */
+esp_err_t qso_log_init(void)
 {
-#if !SOC_USB_OTG_SUPPORTED
-    usb_mount = false;   /* 芯片无 USB OTG, 只能本地挂载 */
-#endif
     const esp_partition_t *part = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, QSO_PART_LABEL);
     if (part == NULL) {
@@ -287,35 +284,13 @@ esp_err_t qso_log_init(bool usb_mount)
         return ESP_ERR_NOT_FOUND;
     }
 
-    esp_err_t err;
-
-    if (!usb_mount) {
-        /* 只本地挂载 FAT(带磨损均衡), 不启动 USB */
-        esp_vfs_fat_mount_config_t mcfg = {
-            .max_files = 4,
-            .format_if_mount_failed = true,
-        };
-        err = esp_vfs_fat_spiflash_mount_rw_wl(QSO_MOUNT_PATH, QSO_PART_LABEL, &mcfg, &s_wl);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "本地挂载 FAT 分区失败: %s", esp_err_to_name(err));
-            return err;
-        }
-        s_ready = true;
-        vTaskDelay(pdMS_TO_TICKS(50));
-        FILE *f0 = fopen(QSO_LOG_PATH, "a");
-        if (f0) { fclose(f0); ESP_LOGI(TAG, "日志就绪(本地): %s", QSO_LOG_PATH); }
-        else    { ESP_LOGW(TAG, "打不开 %s", QSO_LOG_PATH); }
-        return ESP_OK;
-    }
-
-    /* ---- U 盘模式: WL -> MSC 存储 -> USB 驱动 ---- */
-    err = wl_mount(part, &s_wl);
+    /* WL -> MSC 存储(应用挂到 /storage), 先不安装 USB 驱动 */
+    esp_err_t err = wl_mount(part, &s_wl);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wl_mount 失败: %s", esp_err_to_name(err));
         return err;
     }
 
-    /* MSC 驱动(带默认事件回调) */
     tinyusb_msc_driver_config_t drv_cfg = { 0 };
     err = tinyusb_msc_install_driver(&drv_cfg);
     if (err != ESP_OK) {
@@ -325,7 +300,6 @@ esp_err_t qso_log_init(bool usb_mount)
         return err;
     }
 
-    /* 把 vfs 分区做成 MSC 存储: 应用挂到 /storage, 未格式化则自动格式化 */
     tinyusb_msc_storage_config_t st_cfg = {
         .medium = { .wl_handle = s_wl },
         .fat_fs = {
@@ -348,26 +322,30 @@ esp_err_t qso_log_init(bool usb_mount)
         return err;
     }
 
-    /* 安装 USB 设备驱动(默认描述符, 由 Kconfig 打开 MSC) */
-    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
-    err = tinyusb_driver_install(&tusb_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "TinyUSB 驱动安装失败: %s", esp_err_to_name(err));
-        /* 仍可尝试本地写文件, 只是不暴露 U 盘 */
-    }
-
     s_ready = true;
 
-    /* 首次确保文件存在(挂载/格式化需要一点时间) */
     vTaskDelay(pdMS_TO_TICKS(100));
     FILE *f = fopen(QSO_LOG_PATH, "a");
-    if (f) {
-        fclose(f);
-        ESP_LOGI(TAG, "日志就绪: %s (U盘模式可挂载该分区)", QSO_LOG_PATH);
-    } else {
-        ESP_LOGW(TAG, "暂时打不开 %s(可能正被 USB 主机占用)", QSO_LOG_PATH);
-    }
+    if (f) { fclose(f); ESP_LOGI(TAG, "存储就绪: %s", QSO_MOUNT_PATH); }
+    else   { ESP_LOGW(TAG, "打不开 %s", QSO_LOG_PATH); }
     return ESP_OK;
+}
+
+/* ---------------- 启动 USB 大容量存储 ---------------- */
+esp_err_t qso_log_usb_start(void)
+{
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
+    esp_err_t err = tinyusb_driver_install(&tusb_cfg);
+    if (err == ESP_OK) ESP_LOGI(TAG, "USB 大容量存储已启动(U盘)");
+    else               ESP_LOGE(TAG, "TinyUSB 驱动安装失败: %s", esp_err_to_name(err));
+    return err;
+}
+
+/* 把存储从 USB 主机收回应用侧(解除 PC 挂载), 使应用可读写 */
+void qso_log_usb_release(void)
+{
+    if (s_msc) tinyusb_msc_set_storage_mount_point(s_msc, TINYUSB_MSC_STORAGE_MOUNT_APP);
 }
 
 /* ---------------- 写一条 QSO ---------------- */
@@ -505,6 +483,12 @@ esp_err_t cfg_store_save(const ft8_app_config_t *cfg)
 {
     if (cfg == NULL) return ESP_ERR_INVALID_ARG;
     FILE *f = fopen(CFG_STORE_PATH, "w");
+    if (f == NULL) {
+        /* 可能正被 USB 主机挂载: 收回给应用侧再试一次 */
+        qso_log_usb_release();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        f = fopen(CFG_STORE_PATH, "w");
+    }
     if (f == NULL) return ESP_FAIL;
 
     fprintf(f, "# FT8 cfg (auto generated)\n");

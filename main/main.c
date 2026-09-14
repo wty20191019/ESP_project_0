@@ -1148,12 +1148,15 @@ void app_main(void)
     //false
 
     //启动任务============================================================================================
-    /* QSO 日志: 注册回调并初始化 FAT 分区 + USB 大容量存储(U盘) */
+    /* QSO 日志: 注册回调并初始化 FAT 分区; 先读 cfg.txt 再决定是否启动 U 盘 */
     ft8_app_set_qso_callback(qso_log_on_qso, NULL);
-    if (qso_log_init(cfg.usb_mount_enable) == ESP_OK)
-        cfg_store_load(&cfg);          /* 用 /storage/cfg.txt 覆盖已持久化的字段 */
-    else
+    if (qso_log_init() == ESP_OK) {
+        cfg_store_load(&cfg);                  /* 覆盖已持久化字段(含 usb_mount_enable) */
+        if (cfg.usb_mount_enable)
+            qso_log_usb_start();               /* 按 cfg.txt 的值启动 USB 大容量存储 */
+    } else {
         ESP_LOGW(TAG, "QSO 日志存储初始化失败(不影响收发)");
+    }
 
     /* 搬运 GPS UTC 时间/日期/PPS 进 cfg.gps(供 ft8_app UTC 对齐，先启动让它尽早喂数据) */
     xTaskCreatePinnedToCore(gps_time_task, "gps_utc", 4096, NULL, 5, NULL, 1);
