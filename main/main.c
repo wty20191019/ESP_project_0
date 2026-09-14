@@ -873,22 +873,8 @@ static void my_key_callback(key_id_t key_id, key_event_t event, void *user_data)
         return;
     }
 
-    /* 其它页: 上/左上一页, 下/右下一页, 中回首页 */
-    switch (key_id) {
-    case KEY_ID_UP:
-    case KEY_ID_LEFT:
-        s_lcd_page = (page + LCD_PAGE_NUM - 1) % LCD_PAGE_NUM;
-        break;
-    case KEY_ID_DOWN:
-    case KEY_ID_RIGHT:
-        s_lcd_page = (page + 1) % LCD_PAGE_NUM;
-        break;
-    case KEY_ID_MID:
-        s_lcd_page = 0;
-        break;
-    default:
-        break;
-    }
+    /* 其它页(主页/GPS): 方向键不用于翻页; 中键回主页。翻页只用 SET/RST。 */
+    if (key_id == KEY_ID_MID) s_lcd_page = 0;
 }
 
 void app_main(void)
