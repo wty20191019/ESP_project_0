@@ -1456,6 +1456,7 @@ void ft8_app_config_default(ft8_app_config_t *cfg)
     cfg->protocol        = FTX_PROTOCOL_FT8;
     cfg->tx_enable       = true;
     cfg->rx_enable       = true;
+    cfg->usb_mount_enable = true;
     cfg->utc_enable      = true;
     cfg->gps_use_pps     = true;
     cfg->tx_slot_parity  = 0;

@@ -146,7 +146,7 @@ static void build_sys_counts(const gps_info_t *g, char *out, size_t cap)
     }
 }
 
-/* ================= 三页显示 ================= */
+/* ================= 显示 ================= */
 
 /* 第 0 页: 时间 / 日期 / 经纬 / 卫星汇总 / 基本状态 */
 static void draw_page_info(const gps_info_t *src)
@@ -381,6 +381,8 @@ static void draw_page_fft(void)
     }
 }
 
+
+
 /* ================= LCD 主任务 ================= */
 #define LCD_PAGE_NUM    4                  /* 页数: 0=信息 1=卫星 2=信号 3=瀑布 */
 static volatile int s_lcd_page = 0;        /* 当前显示页, 由按键回调修改 */
@@ -404,10 +406,11 @@ static void LCD_task(void *arg)
         int page = s_lcd_page;              /* 手动按键翻页, 不再自动轮换 */
 
         LCD_Clear(BLACK);
-        if (page == 0)      draw_page_info(&g);
-        else if (page == 1) draw_page_sat(&g);
-        else if (page == 2) draw_page_signal(g);
-        else if (page == 3) draw_page_fft();
+        if (page == 0)      draw_page_info(&g);     //gps时间/经纬/卫星汇总/状态
+        else if (page == 1) draw_page_sat(&g);      //gps卫星明细
+        else if (page == 2) draw_page_signal(g);    //gps信号强度
+        else if (page == 3) draw_page_fft();        //频谱
+
 
         LCD_Flush();                       /* 画完一整帧后一次性推送 */
 
@@ -557,13 +560,15 @@ void app_main(void)
     cfg.qso.max_retries      = 4;          // 超过此次数仍无进展则放弃该台
     cfg.qso.target_callsign[0] = '\0';     // 应答模式: 只应答此呼号, 空则应答所有陌生 CQ 台
 
+    cfg.usb_mount_enable    = false;       // false=不启动 USB, 只本地写 /storage/log.txt    是否把日志分区作为 U 盘挂载(USB MSC 暴露给 PC);  只本地挂载 FAT 写日志, 不启动 USB 
+    
     //true 
     //false
 
     //启动任务============================================================================================
     /* QSO 日志: 注册回调并初始化 FAT 分区 + USB 大容量存储(U盘) */
     ft8_app_set_qso_callback(qso_log_on_qso, NULL);
-    if (qso_log_init() != ESP_OK)
+    if (qso_log_init(cfg.usb_mount_enable) != ESP_OK)
         ESP_LOGW(TAG, "QSO 日志存储初始化失败(不影响收发)");
 
     /* 搬运 GPS UTC 时间/日期/PPS 进 cfg.gps(供 ft8_app UTC 对齐，先启动让它尽早喂数据) */

@@ -145,6 +145,8 @@ typedef struct {
     ftx_protocol_t protocol;    /*!< FTX_PROTOCOL_FT8(15s 时隙) / FTX_PROTOCOL_FT4(7.5s) */
     bool tx_enable;             /*!< 是否参与发射(在选中时隙内) */
     bool rx_enable;             /*!< 是否持续接收解码 */
+    bool usb_mount_enable;      /*!< 是否把日志分区作为 U 盘挂载(USB MSC 暴露给 PC);
+                                 *    false=只本地挂载 FAT 写日志, 不启动 USB */
 
     /* ---- 时间(宏观层) ---- */
     bool utc_enable;            /*!< 总开关：按 UTC 对齐 15s/7.5s 栅格；

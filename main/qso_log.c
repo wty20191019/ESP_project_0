@@ -22,6 +22,7 @@
 #include "esp_err.h"
 #include "esp_partition.h"
 #include "wear_levelling.h"
+#include "esp_vfs_fat.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -110,12 +111,11 @@ static int grid_distance_km(const char *g1, const char *g2)
 }
 
 /* ---------------- 初始化 ---------------- */
-esp_err_t qso_log_init(void)
+esp_err_t qso_log_init(bool usb_mount)
 {
 #if !SOC_USB_OTG_SUPPORTED
-    ESP_LOGW(TAG, "该芯片无 USB OTG, 日志仅本地可用(不暴露 U 盘)");
-    return ESP_ERR_NOT_SUPPORTED;
-#else
+    usb_mount = false;   /* 芯片无 USB OTG, 只能本地挂载 */
+#endif
     const esp_partition_t *part = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, QSO_PART_LABEL);
     if (part == NULL) {
@@ -123,7 +123,29 @@ esp_err_t qso_log_init(void)
         return ESP_ERR_NOT_FOUND;
     }
 
-    esp_err_t err = wl_mount(part, &s_wl);
+    esp_err_t err;
+
+    if (!usb_mount) {
+        /* 只本地挂载 FAT(带磨损均衡), 不启动 USB */
+        esp_vfs_fat_mount_config_t mcfg = {
+            .max_files = 4,
+            .format_if_mount_failed = true,
+        };
+        err = esp_vfs_fat_spiflash_mount_rw_wl(QSO_MOUNT_PATH, QSO_PART_LABEL, &mcfg, &s_wl);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "本地挂载 FAT 分区失败: %s", esp_err_to_name(err));
+            return err;
+        }
+        s_ready = true;
+        vTaskDelay(pdMS_TO_TICKS(50));
+        FILE *f0 = fopen(QSO_LOG_PATH, "a");
+        if (f0) { fclose(f0); ESP_LOGI(TAG, "日志就绪(本地): %s", QSO_LOG_PATH); }
+        else    { ESP_LOGW(TAG, "打不开 %s", QSO_LOG_PATH); }
+        return ESP_OK;
+    }
+
+    /* ---- U 盘模式: WL -> MSC 存储 -> USB 驱动 ---- */
+    err = wl_mount(part, &s_wl);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wl_mount 失败: %s", esp_err_to_name(err));
         return err;
@@ -182,7 +204,6 @@ esp_err_t qso_log_init(void)
         ESP_LOGW(TAG, "暂时打不开 %s(可能正被 USB 主机占用)", QSO_LOG_PATH);
     }
     return ESP_OK;
-#endif
 }
 
 /* ---------------- 写一条 QSO ---------------- */
