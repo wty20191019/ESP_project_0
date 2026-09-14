@@ -274,12 +274,9 @@ static int grid_distance_km(const char *g1, const char *g2)
     return (int)(R * c + 0.5);
 }
 
-/* ---------------- 初始化 ---------------- */
-esp_err_t qso_log_init(bool usb_mount)
+/* ---------------- 初始化(只挂载本地, 不启 USB) ---------------- */
+esp_err_t qso_log_init(void)
 {
-#if !SOC_USB_OTG_SUPPORTED
-    usb_mount = false;   /* 芯片无 USB OTG, 只能本地挂载 */
-#endif
     const esp_partition_t *part = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_FAT, QSO_PART_LABEL);
     if (part == NULL) {
@@ -287,35 +284,13 @@ esp_err_t qso_log_init(bool usb_mount)
         return ESP_ERR_NOT_FOUND;
     }
 
-    esp_err_t err;
-
-    if (!usb_mount) {
-        /* 只本地挂载 FAT(带磨损均衡), 不启动 USB */
-        esp_vfs_fat_mount_config_t mcfg = {
-            .max_files = 4,
-            .format_if_mount_failed = true,
-        };
-        err = esp_vfs_fat_spiflash_mount_rw_wl(QSO_MOUNT_PATH, QSO_PART_LABEL, &mcfg, &s_wl);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "本地挂载 FAT 分区失败: %s", esp_err_to_name(err));
-            return err;
-        }
-        s_ready = true;
-        vTaskDelay(pdMS_TO_TICKS(50));
-        FILE *f0 = fopen(QSO_LOG_PATH, "a");
-        if (f0) { fclose(f0); ESP_LOGI(TAG, "日志就绪(本地): %s", QSO_LOG_PATH); }
-        else    { ESP_LOGW(TAG, "打不开 %s", QSO_LOG_PATH); }
-        return ESP_OK;
-    }
-
-    /* ---- U 盘模式: WL -> MSC 存储 -> USB 驱动 ---- */
-    err = wl_mount(part, &s_wl);
+    /* WL -> MSC 存储(应用挂到 /storage), 先不安装 USB 驱动 */
+    esp_err_t err = wl_mount(part, &s_wl);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "wl_mount 失败: %s", esp_err_to_name(err));
         return err;
     }
 
-    /* MSC 驱动(带默认事件回调) */
     tinyusb_msc_driver_config_t drv_cfg = { 0 };
     err = tinyusb_msc_install_driver(&drv_cfg);
     if (err != ESP_OK) {
@@ -325,7 +300,6 @@ esp_err_t qso_log_init(bool usb_mount)
         return err;
     }
 
-    /* 把 vfs 分区做成 MSC 存储: 应用挂到 /storage, 未格式化则自动格式化 */
     tinyusb_msc_storage_config_t st_cfg = {
         .medium = { .wl_handle = s_wl },
         .fat_fs = {
@@ -348,26 +322,30 @@ esp_err_t qso_log_init(bool usb_mount)
         return err;
     }
 
-    /* 安装 USB 设备驱动(默认描述符, 由 Kconfig 打开 MSC) */
-    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
-    err = tinyusb_driver_install(&tusb_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "TinyUSB 驱动安装失败: %s", esp_err_to_name(err));
-        /* 仍可尝试本地写文件, 只是不暴露 U 盘 */
-    }
-
     s_ready = true;
 
-    /* 首次确保文件存在(挂载/格式化需要一点时间) */
     vTaskDelay(pdMS_TO_TICKS(100));
     FILE *f = fopen(QSO_LOG_PATH, "a");
-    if (f) {
-        fclose(f);
-        ESP_LOGI(TAG, "日志就绪: %s (U盘模式可挂载该分区)", QSO_LOG_PATH);
-    } else {
-        ESP_LOGW(TAG, "暂时打不开 %s(可能正被 USB 主机占用)", QSO_LOG_PATH);
-    }
+    if (f) { fclose(f); ESP_LOGI(TAG, "存储就绪: %s", QSO_MOUNT_PATH); }
+    else   { ESP_LOGW(TAG, "打不开 %s", QSO_LOG_PATH); }
     return ESP_OK;
+}
+
+/* ---------------- 启动 USB 大容量存储 ---------------- */
+esp_err_t qso_log_usb_start(void)
+{
+    if (!s_ready) return ESP_ERR_INVALID_STATE;
+    tinyusb_config_t tusb_cfg = TINYUSB_DEFAULT_CONFIG();
+    esp_err_t err = tinyusb_driver_install(&tusb_cfg);
+    if (err == ESP_OK) ESP_LOGI(TAG, "USB 大容量存储已启动(U盘)");
+    else               ESP_LOGE(TAG, "TinyUSB 驱动安装失败: %s", esp_err_to_name(err));
+    return err;
+}
+
+/* 把存储从 USB 主机收回应用侧(解除 PC 挂载), 使应用可读写 */
+void qso_log_usb_release(void)
+{
+    if (s_msc) tinyusb_msc_set_storage_mount_point(s_msc, TINYUSB_MSC_STORAGE_MOUNT_APP);
 }
 
 /* ---------------- 写一条 QSO ---------------- */
@@ -432,4 +410,105 @@ void qso_log_on_qso(const ft8_qso_record_t *rec, void *arg)
     fputs(line, f);
     fclose(f);
     ESP_LOGI(TAG, "QSO 已记录: %s", line);
+}
+
+/* ================= cfg.txt 持久化(仅持久化选定字段) ================= */
+static void trim_tail(char *s)
+{
+    size_t l = strlen(s);
+    while (l > 0 && (s[l - 1] == '\n' || s[l - 1] == '\r' || s[l - 1] == ' ')) s[--l] = '\0';
+}
+
+esp_err_t cfg_store_load(ft8_app_config_t *cfg)
+{
+    if (cfg == NULL) return ESP_ERR_INVALID_ARG;
+    FILE *f = fopen(CFG_STORE_PATH, "r");
+    if (f == NULL) return ESP_ERR_NOT_FOUND;
+
+    char line[160];
+    while (fgets(line, sizeof(line), f)) {
+        char *eq = strchr(line, '=');
+        if (eq == NULL) continue;
+        *eq = '\0';
+        char *k = line, *v = eq + 1;
+        while (*k == ' ') k++;
+        while (*v == ' ') v++;
+        trim_tail(v);
+
+        if (!strcmp(k, "callsign")) {
+            strncpy(cfg->callsign, v, sizeof(cfg->callsign) - 1);
+            cfg->callsign[sizeof(cfg->callsign) - 1] = '\0';
+        } else if (!strcmp(k, "grid")) {
+            strncpy(cfg->grid, v, sizeof(cfg->grid) - 1);
+            cfg->grid[sizeof(cfg->grid) - 1] = '\0';
+        } else if (!strcmp(k, "band")) {
+            strncpy(cfg->band, v, sizeof(cfg->band) - 1);
+            cfg->band[sizeof(cfg->band) - 1] = '\0';
+        } else if (!strcmp(k, "qso_freq_mhz")) {
+            cfg->qso_freq_mhz = (float)atof(v);
+        } else if (!strcmp(k, "protocol")) {
+            cfg->protocol = (ftx_protocol_t)atoi(v);
+        } else if (!strcmp(k, "usb_mount_enable")) {
+            cfg->usb_mount_enable = atoi(v) ? true : false;
+        } else if (!strcmp(k, "utc_enable")) {
+            cfg->utc_enable = atoi(v) ? true : false;
+        } else if (!strcmp(k, "gps_utc_enable")) {
+            cfg->gps_utc_enable = atoi(v) ? true : false;
+        } else if (!strcmp(k, "gps_use_pps")) {
+            cfg->gps_use_pps = atoi(v) ? true : false;
+        } else if (!strcmp(k, "tx_slot_parity")) {
+            cfg->tx_slot_parity = atoi(v) & 1;
+        } else if (!strcmp(k, "tx_delay_ms")) {
+            cfg->tx_delay_ms = (uint32_t)strtoul(v, NULL, 10);
+        } else if (!strcmp(k, "audio_level")) {
+            cfg->audio_level = (float)atof(v);
+        } else if (!strcmp(k, "max_candidates")) {
+            cfg->max_candidates = atoi(v);
+        } else if (!strcmp(k, "ldpc_iterations")) {
+            cfg->ldpc_iterations = atoi(v);
+        } else if (!strcmp(k, "rx_parse_ms")) {
+            cfg->rx_parse_ms = (uint32_t)strtoul(v, NULL, 10);
+        } else if (!strcmp(k, "rx_time_osr")) {
+            cfg->rx_time_osr = atoi(v);
+        } else if (!strcmp(k, "rx_freq_osr")) {
+            cfg->rx_freq_osr = atoi(v);
+        }
+    }
+    fclose(f);
+    ESP_LOGI(TAG, "已加载 %s", CFG_STORE_PATH);
+    return ESP_OK;
+}
+
+esp_err_t cfg_store_save(const ft8_app_config_t *cfg)
+{
+    if (cfg == NULL) return ESP_ERR_INVALID_ARG;
+    FILE *f = fopen(CFG_STORE_PATH, "w");
+    if (f == NULL) {
+        /* 可能正被 USB 主机挂载: 收回给应用侧再试一次 */
+        qso_log_usb_release();
+        vTaskDelay(pdMS_TO_TICKS(50));
+        f = fopen(CFG_STORE_PATH, "w");
+    }
+    if (f == NULL) return ESP_FAIL;
+
+    fprintf(f, "# FT8 cfg (auto generated)\n");
+    fprintf(f, "callsign=%s\n",        cfg->callsign);
+    fprintf(f, "grid=%s\n",            cfg->grid);
+    fprintf(f, "band=%s\n",            cfg->band);
+    fprintf(f, "qso_freq_mhz=%.6f\n",  (double)cfg->qso_freq_mhz);
+    fprintf(f, "protocol=%d\n",        (int)cfg->protocol);
+    fprintf(f, "usb_mount_enable=%d\n", cfg->usb_mount_enable ? 1 : 0);
+    fprintf(f, "utc_enable=%d\n",      cfg->utc_enable ? 1 : 0);
+    fprintf(f, "gps_utc_enable=%d\n",  cfg->gps_utc_enable ? 1 : 0);
+    fprintf(f, "gps_use_pps=%d\n",     cfg->gps_use_pps ? 1 : 0);
+    fprintf(f, "tx_slot_parity=%d\n",  cfg->tx_slot_parity);
+    fprintf(f, "tx_delay_ms=%lu\n",    (unsigned long)cfg->tx_delay_ms);
+    fprintf(f, "audio_level=%.2f\n",   (double)cfg->audio_level);
+    fprintf(f, "max_candidates=%d\n",  cfg->max_candidates);
+    fprintf(f, "ldpc_iterations=%d\n", cfg->ldpc_iterations);
+    fprintf(f, "rx_parse_ms=%lu\n",    (unsigned long)cfg->rx_parse_ms);
+    fprintf(f, "rx_time_osr=%d\n",     cfg->rx_time_osr);
+    fprintf(f, "rx_freq_osr=%d\n",     cfg->rx_freq_osr);
+    fclose(f);
+    return ESP_OK;
 }

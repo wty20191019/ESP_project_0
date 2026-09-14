@@ -29,6 +29,7 @@
 /* FT8 应用全局配置：以引用交给 ft8_app(需保持有效)；
  * 下面 gps_time_task 会持续把 GPS UTC 时间/日期/PPS 填入 cfg.gps */
 static ft8_app_config_t cfg;
+static volatile bool s_cfg_dirty = false;   /* 配置被修改, 待写入 cfg.txt */
 
 /* 屏幕显示本地时间所用时区(北京 = UTC+8)。UTC 直接显示可改为 0 */
 #define LCD_TZ_HOUR    8
@@ -437,6 +438,7 @@ static void main_adjust(int dir)
     }
     default: break;
     }
+    s_cfg_dirty = true;
 }
 
 static void draw_page_main(void)
@@ -747,7 +749,10 @@ static const ci_item_t s_ci[] = {
 static int s_ci_sel = 0;
 static int s_ci_scroll = 0;
 static int s_ci_cursor = 0;
-static const char s_ci_charset[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/.-";
+static bool s_ci_edit = false;      /* 是否处于修改状态(中键进/出) */
+/* 字符集: 空格 + 大小写字母 + 数字 + 符号 / \ ' ? . - = + _ */
+static const char s_ci_charset[] =
+    " ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/\\'?.-=+_";
 
 /* 把配置项当前值格式化成字符串(与显示一致), 返回长度 */
 static int ci_value_str(const ci_item_t *it, char *out, size_t cap)
@@ -770,8 +775,8 @@ static int ci_value_str(const ci_item_t *it, char *out, size_t cap)
     return (int)strlen(out);
 }
 
-/* 按 dir 修改"当前光标所在的那一位": 数值改该位数字(不进位), 字符串换字符, 枚举/布尔整体切换 */
-static void ci_edit_char(const ci_item_t *it, int dir)
+/* 修改"当前光标位": 数值按该位的权值加减(带进位/借位), 字符串换字符, 枚举/布尔整体切换 */
+static void ci_edit_step(const ci_item_t *it, int dir)
 {
     if (it->type == CI_BOOL) { *(bool *)it->ptr = !*(bool *)it->ptr; return; }
     if (it->type == CI_ENUM) {
@@ -801,29 +806,50 @@ static void ci_edit_char(const ci_item_t *it, int dir)
         return;
     }
 
-    /* 数值: 只改该位字符, 再解析回字段 */
-    if (c >= '0' && c <= '9') {
-        int d = c - '0';
-        d = (d + dir + 10) % 10;
-        v[pos] = (char)('0' + d);
-    } else if ((c == '-' || c == '+') && pos == 0) {
-        v[0] = (c == '-') ? '+' : '-';
-    } else {
+    /* 数值: 符号位切换正负 */
+    if (c == '-' || c == '+') {
+        if (it->type == CI_INT) {
+            int x = -*(int *)it->ptr;
+            if (x < (int)it->vmin) x = (int)it->vmin;
+            if (x > (int)it->vmax) x = (int)it->vmax;
+            *(int *)it->ptr = x;
+        } else if (it->type == CI_FLOAT) {
+            float x = -*(float *)it->ptr;
+            if (x < it->vmin) x = it->vmin;
+            if (x > it->vmax) x = it->vmax;
+            *(float *)it->ptr = x;
+        }
         return;
     }
+    if (c < '0' || c > '9') return;
+
+    /* 计算光标所在位的权值: 整数位=10^n, 小数位=10^-n */
+    bool frac = false;
+    for (int i = 0; i < pos; i++) if (v[i] == '.') { frac = true; break; }
+    int cnt = 0;
+    if (!frac) {
+        for (int i = pos + 1; i < len; i++) {
+            if (v[i] == '.') break;
+            if (v[i] >= '0' && v[i] <= '9') cnt++;
+        }
+    } else {
+        for (int i = pos; i < len; i++)
+            if (v[i] >= '0' && v[i] <= '9') cnt++;
+    }
+    double place = pow(10.0, frac ? -cnt : cnt);
 
     if (it->type == CI_INT) {
-        long x = strtol(v, NULL, 10);
+        long x = (long)*(int *)it->ptr + (long)(dir * place);
         if (x < (long)it->vmin) x = (long)it->vmin;
         if (x > (long)it->vmax) x = (long)it->vmax;
         *(int *)it->ptr = (int)x;
     } else if (it->type == CI_U32) {
-        long x = strtol(v, NULL, 10);
+        long x = (long)*(uint32_t *)it->ptr + (long)(dir * place);
         if (x < (long)it->vmin) x = (long)it->vmin;
         if (x > (long)it->vmax) x = (long)it->vmax;
         *(uint32_t *)it->ptr = (uint32_t)x;
     } else if (it->type == CI_FLOAT) {
-        double x = strtod(v, NULL);
+        double x = (double)*(float *)it->ptr + dir * place;
         if (x < (double)it->vmin) x = it->vmin;
         if (x > (double)it->vmax) x = it->vmax;
         *(float *)it->ptr = (float)x;
@@ -833,13 +859,17 @@ static void ci_edit_char(const ci_item_t *it, int dir)
 static void ci_key(key_id_t k)
 {
     const ci_item_t *it = &s_ci[s_ci_sel];
-    switch (k) {
-    case KEY_ID_UP:    if (s_ci_sel > 0) s_ci_sel--; break;
-    case KEY_ID_DOWN:  if (s_ci_sel < CI_N - 1) s_ci_sel++; break;
-    case KEY_ID_LEFT:  ci_edit_char(it, -1); break;
-    case KEY_ID_RIGHT: ci_edit_char(it, +1); break;
-    case KEY_ID_MID: {
-        /* 光标右移到下一位(字符串/数值按值长度, 枚举/布尔固定 1 位) */
+
+    if (!s_ci_edit) {
+        /* 选择状态: 上下选字段, 中键进入修改 */
+        switch (k) {
+        case KEY_ID_UP:   if (s_ci_sel > 0) s_ci_sel--; break;
+        case KEY_ID_DOWN: if (s_ci_sel < CI_N - 1) s_ci_sel++; break;
+        case KEY_ID_MID:  s_ci_edit = true; s_ci_cursor = 0; break;
+        default: break;
+        }
+    } else {
+        /* 修改状态: 左右选修改位, 上下按该位权值加减/换字符, 中键退出 */
         int vlen = 1;
         if (it->type == CI_STR || it->type == CI_INT ||
             it->type == CI_U32 || it->type == CI_FLOAT) {
@@ -847,18 +877,26 @@ static void ci_key(key_id_t k)
             vlen = ci_value_str(it, v, sizeof(v));
             if (vlen < 1) vlen = 1;
         }
-        s_ci_cursor = (s_ci_cursor + 1) % vlen;
-        break;
+        switch (k) {
+        case KEY_ID_LEFT:  if (s_ci_cursor > 0) s_ci_cursor--; break;
+        case KEY_ID_RIGHT: if (s_ci_cursor < vlen - 1) s_ci_cursor++; break;
+        case KEY_ID_UP:    ci_edit_step(it, +1); break;
+        case KEY_ID_DOWN:  ci_edit_step(it, -1); break;
+        case KEY_ID_MID:   s_ci_edit = false; break;
+        default: break;
+        }
+        if (s_ci_cursor >= vlen) s_ci_cursor = vlen - 1;
+        if (s_ci_cursor < 0) s_ci_cursor = 0;
     }
-    default: break;
-    }
+
     if (s_ci_sel < s_ci_scroll) s_ci_scroll = s_ci_sel;
     if (s_ci_sel >= s_ci_scroll + 9) s_ci_scroll = s_ci_sel - 8;
+    s_cfg_dirty = true;
 }
 
 static void draw_page_cfg_set(void)
 {
-    lcd_row(0, CYAN, "CFG SET %d/%d", s_ci_sel + 1, CI_N);
+    lcd_row(0, CYAN, "CFG SET %d/%d%s", s_ci_sel + 1, CI_N, s_ci_edit ? " EDIT" : "");
 
     for (int r = 0; r < 9; r++) {
         int i = s_ci_scroll + r;
@@ -883,7 +921,7 @@ static void draw_page_cfg_set(void)
             continue;
         }
 
-        /* 选中行: 手工绘制, 并把光标所在位用反色(黑字黄底)高亮 */
+        /* 选中行: 手工绘制; 修改状态反色高亮光标位 */
         char val[24];
         int vlen = ci_value_str(it, val, sizeof(val));
         int pos = s_ci_cursor;
@@ -904,7 +942,7 @@ static void draw_page_cfg_set(void)
         LCD_ShowString((uint16_t)(hl * 8), (uint16_t)y, (const uint8_t *)val, YELLOW, BLACK, 16, 0);
 
         int cx = hl + pos;
-        if (vlen > 0 && cx < 16)
+        if (s_ci_edit && vlen > 0 && cx < 16)
             LCD_ShowChar((uint16_t)(cx * 8), (uint16_t)y, (uint8_t)val[pos], BLACK, YELLOW, 16, 0);
     }
 }
@@ -939,6 +977,14 @@ static void LCD_task(void *arg)
         else if (page == 4) draw_page_cfg_set();    //配置设置, 可设置 cfg 所有内容
 
         LCD_Flush();                       /* 画完一整帧后一次性推送 */
+
+        /* 配置改动后约 2s 落盘到 /storage/cfg.txt */
+        {
+            static uint32_t save_tick = 0;
+            if (s_cfg_dirty && (++save_tick % 100) == 0) {
+                if (cfg_store_save(&cfg) == ESP_OK) s_cfg_dirty = false;
+            }
+        }
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -1137,10 +1183,15 @@ void app_main(void)
     //false
 
     //启动任务============================================================================================
-    /* QSO 日志: 注册回调并初始化 FAT 分区 + USB 大容量存储(U盘) */
+    /* QSO 日志: 注册回调并初始化 FAT 分区; 先读 cfg.txt 再决定是否启动 U 盘 */
     ft8_app_set_qso_callback(qso_log_on_qso, NULL);
-    if (qso_log_init(cfg.usb_mount_enable) != ESP_OK)
+    if (qso_log_init() == ESP_OK) {
+        cfg_store_load(&cfg);                  /* 覆盖已持久化字段(含 usb_mount_enable) */
+        if (cfg.usb_mount_enable)
+            qso_log_usb_start();               /* 按 cfg.txt 的值启动 USB 大容量存储 */
+    } else {
         ESP_LOGW(TAG, "QSO 日志存储初始化失败(不影响收发)");
+    }
 
     /* 搬运 GPS UTC 时间/日期/PPS 进 cfg.gps(供 ft8_app UTC 对齐，先启动让它尽早喂数据) */
     xTaskCreatePinnedToCore(gps_time_task, "gps_utc", 4096, NULL, 5, NULL, 1);
