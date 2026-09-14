@@ -40,6 +40,35 @@ static wl_handle_t s_wl = WL_INVALID_HANDLE;
 static tinyusb_msc_storage_handle_t s_msc = NULL;
 static bool s_ready = false;
 
+/* 最近 QSO 摘要环形(给 LCD 日志页) */
+static char s_lines[QSO_LOG_RAM_MAX][40];
+static int  s_line_head = 0;
+static int  s_line_n = 0;
+
+const char *qso_log_line(int idx)
+{
+    if (idx < 0 || idx >= s_line_n) return NULL;
+    int i = (s_line_head - 1 - idx + QSO_LOG_RAM_MAX * 2) % QSO_LOG_RAM_MAX;
+    return s_lines[i];
+}
+
+int qso_log_lines(void)
+{
+    return s_line_n;
+}
+
+static void qso_log_ram_add(const ft8_qso_record_t *rec)
+{
+    char *d = s_lines[s_line_head];
+    snprintf(d, 40, "%s %s %+d/%+d %02u%02uZ",
+             rec->call, rec->grid[0] ? rec->grid : "----",
+             rec->rst_sent, rec->rst_rcvd,
+             rec->hour_off, rec->minute_off);
+    d[39] = '\0';
+    s_line_head = (s_line_head + 1) % QSO_LOG_RAM_MAX;
+    if (s_line_n < QSO_LOG_RAM_MAX) s_line_n++;
+}
+
 /* ---------------- ADIF 拼接 ---------------- */
 /* 手工拼接, 不用 snprintf 的 %s(避免 -Werror=format-truncation) */
 static int adif_add(char *buf, int pos, int cap, const char *name, const char *val)
@@ -211,6 +240,8 @@ void qso_log_on_qso(const ft8_qso_record_t *rec, void *arg)
 {
     (void)arg;
     if (!s_ready || rec == NULL) return;
+
+    qso_log_ram_add(rec);
 
     char d_on[16] = "00000000", t_on[16] = "000000";
     char d_off[16] = "00000000", t_off[16] = "000000";

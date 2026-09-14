@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -381,10 +382,266 @@ static void draw_page_fft(void)
     }
 }
 
+/* ================= 页 4: RX 解码信息 ================= */
+static void draw_page_RX(void)
+{
+    lcd_row(0, CYAN, "RX DECODE");
+    const ft8_rx_log_t *log = ft8_rx_log();
+    if (log == NULL || log->seq == 0) {
+        lcd_row(4, GRAY, "wait decode...");
+        return;
+    }
+    uint32_t n = (log->seq < FT8_RX_MSG_MAX) ? log->seq : FT8_RX_MSG_MAX;
+    for (uint32_t k = 0; k < n && k < 9; k++) {
+        uint32_t idx = (log->put - 1 - k + FT8_RX_MSG_MAX * 2) % FT8_RX_MSG_MAX;
+        const ft8_rx_msg_t *m = &log->msgs[idx];
+        if (isfinite(m->snr_db))
+            lcd_row(1 + (int)k, WHITE, "%4.0f %+3.0f %s", m->freq_hz, m->snr_db, m->text);
+        else
+            lcd_row(1 + (int)k, WHITE, "%4.0f  --  %s", m->freq_hz, m->text);
+    }
+}
 
+/* ================= 页 5: TX 设置 ================= */
+static const char *const s_msg_opts[] = { "CQ", "CALL", "REPORT", "R_REPORT", "RRR", "RR73", "73" };
+static const char *const s_cqmod_opts[] = { "", "DX", "WW", "TEST", "POTA", "SOTA" };
+#define TX_SEL_N 4
+static int s_tx_sel = 0;
+static int s_tx_cursor = 0;
+
+static void tx_adjust(int dir)
+{
+    switch (s_tx_sel) {
+    case 0: {   /* 消息类型 */
+        int v = (int)cfg.tx.type + dir;
+        if (v < 0) v = 6;
+        if (v > 6) v = 0;
+        cfg.tx.type = (ft8_app_msg_type_t)v;
+        break;
+    }
+    case 1: {   /* 目标呼号: 逐字符编辑 */
+        const char *set = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/";
+        char *s = cfg.tx.call_to;
+        int len = (int)sizeof(cfg.tx.call_to);
+        int cur = s_tx_cursor;
+        if (cur < 0) cur = 0;
+        if (cur >= len - 1) cur = len - 2;
+        const char *p = strchr(set, s[cur]);
+        int idx = p ? (int)(p - set) : 0;
+        idx = (idx + dir + (int)strlen(set)) % (int)strlen(set);
+        s[cur] = set[idx];
+        if (s[cur] && cur + 1 < len && s[cur + 1] == '\0') s[cur + 1] = '\0';
+        break;
+    }
+    case 2:     /* 报告 dB */
+        cfg.tx.rst_db += dir;
+        if (cfg.tx.rst_db < -30) cfg.tx.rst_db = -30;
+        if (cfg.tx.rst_db > 30) cfg.tx.rst_db = 30;
+        break;
+    case 3: {   /* CQ 修饰 */
+        int n = (int)(sizeof(s_cqmod_opts) / sizeof(s_cqmod_opts[0]));
+        int cur = 0;
+        for (int i = 0; i < n; i++)
+            if (strcmp(cfg.tx.cq_modifier, s_cqmod_opts[i]) == 0) { cur = i; break; }
+        cur = (cur + dir + n) % n;
+        strncpy(cfg.tx.cq_modifier, s_cqmod_opts[cur], sizeof(cfg.tx.cq_modifier) - 1);
+        cfg.tx.cq_modifier[sizeof(cfg.tx.cq_modifier) - 1] = '\0';
+        break;
+    }
+    default: break;
+    }
+}
+
+static void draw_page_TX(void)
+{
+    const char *mark = ">";
+    lcd_row(0, CYAN, "TX SET");
+    lcd_row(1, s_tx_sel == 0 ? YELLOW : WHITE, "%sTYP %s", s_tx_sel == 0 ? mark : " ",
+            s_msg_opts[(int)cfg.tx.type <= 6 ? (int)cfg.tx.type : 0]);
+    lcd_row(2, s_tx_sel == 1 ? YELLOW : WHITE, "%sTO  %s", s_tx_sel == 1 ? mark : " ",
+            cfg.tx.call_to[0] ? cfg.tx.call_to : "-");
+    lcd_row(3, s_tx_sel == 2 ? YELLOW : WHITE, "%sRST %+d", s_tx_sel == 2 ? mark : " ", cfg.tx.rst_db);
+    lcd_row(4, s_tx_sel == 3 ? YELLOW : WHITE, "%sCQM %s", s_tx_sel == 3 ? mark : " ",
+            cfg.tx.cq_modifier[0] ? cfg.tx.cq_modifier : "-");
+    lcd_row(5, WHITE, "AF  %.0fHz", cfg.audio_freq_hz);
+    lcd_row(6, WHITE, "LVL %.2f", cfg.audio_level);
+    lcd_row(7, WHITE, "PAR %s", (cfg.tx_slot_parity & 1) ? "odd" : "even");
+    lcd_row(8, WHITE, "DLY %lums", (unsigned long)cfg.tx_delay_ms);
+    lcd_row(9, cfg.tx_enable ? GREEN : GRAY, "TX  %s", cfg.tx_enable ? "ON" : "OFF");
+}
+
+/* ================= 页 6: QSO 日志 ================= */
+static int s_log_scroll = 0;
+
+static void draw_page_log(void)
+{
+    int n = qso_log_lines();
+    lcd_row(0, CYAN, "QSO LOG %d", n);
+    if (n == 0) {
+        lcd_row(4, GRAY, "no QSO yet");
+        return;
+    }
+    if (s_log_scroll > n - 1) s_log_scroll = n - 1;
+    if (s_log_scroll < 0) s_log_scroll = 0;
+    for (int k = 0; k < 9 && (s_log_scroll + k) < n; k++) {
+        const char *line = qso_log_line(s_log_scroll + k);
+        lcd_row(1 + k, WHITE, "%s", line ? line : "");
+    }
+    lcd_row(9, GRAY, "scroll %d/%d", s_log_scroll, n > 9 ? n - 9 : 0);
+}
+
+/* ================= 页 7: 配置设置(可编辑 cfg 所有主要项) ================= */
+typedef enum { CI_BOOL, CI_INT, CI_U32, CI_FLOAT, CI_STR, CI_ENUM } ci_type_t;
+
+typedef struct {
+    const char *name;
+    ci_type_t   type;
+    void       *ptr;
+    float       vmin, vmax, step;
+    int         len;                 /* 字符串缓冲长度 */
+    const char *const *opts;         /* 枚举选项名 */
+    int         nopts;
+    int         dec;                 /* 浮点显示小数位 */
+} ci_item_t;
+
+static const char *const s_proto_opts[] = { "FT8", "FT4" };
+
+static const ci_item_t s_ci[] = {
+    { "callsign", CI_STR,   cfg.callsign,              0,0,0, sizeof(cfg.callsign), NULL, 0, 0 },
+    { "grid",     CI_STR,   cfg.grid,                  0,0,0, sizeof(cfg.grid),     NULL, 0, 0 },
+    { "band",     CI_STR,   cfg.band,                  0,0,0, sizeof(cfg.band),     NULL, 0, 0 },
+    { "freq_MHz", CI_FLOAT, &cfg.qso_freq_mhz,       0.1f, 60.0f, 0.001f, 0, NULL, 0, 6 },
+    { "protocol", CI_ENUM,  &cfg.protocol,             0,0,0, 0, s_proto_opts, 2, 0 },
+    { "tx_en",    CI_BOOL,  &cfg.tx_enable,            0,0,0, 0, NULL, 0, 0 },
+    { "rx_en",    CI_BOOL,  &cfg.rx_enable,            0,0,0, 0, NULL, 0, 0 },
+    { "usb_msc",  CI_BOOL,  &cfg.usb_mount_enable,     0,0,0, 0, NULL, 0, 0 },
+    { "utc_en",   CI_BOOL,  &cfg.utc_enable,           0,0,0, 0, NULL, 0, 0 },
+    { "gps_utc",  CI_BOOL,  &cfg.gps_utc_enable,       0,0,0, 0, NULL, 0, 0 },
+    { "gps_pps",  CI_BOOL,  &cfg.gps_use_pps,          0,0,0, 0, NULL, 0, 0 },
+    { "slot_par", CI_INT,   &cfg.tx_slot_parity,       0, 1, 1, 0, NULL, 0, 0 },
+    { "delay_ms", CI_U32,   &cfg.tx_delay_ms,          0, 10000, 50, 0, NULL, 0, 0 },
+    { "msg_type", CI_ENUM,  &cfg.tx.type,              0,0,0, 0, s_msg_opts, 7, 0 },
+    { "call_to",  CI_STR,   cfg.tx.call_to,            0,0,0, sizeof(cfg.tx.call_to), NULL, 0, 0 },
+    { "cq_mod",   CI_STR,   cfg.tx.cq_modifier,        0,0,0, sizeof(cfg.tx.cq_modifier), NULL, 0, 0 },
+    { "rst_db",   CI_INT,   &cfg.tx.rst_db,          -30, 30, 1, 0, NULL, 0, 0 },
+    { "af_Hz",    CI_FLOAT, &cfg.audio_freq_hz,      100, 3000, 10, 0, NULL, 0, 0 },
+    { "af_lvl",   CI_FLOAT, &cfg.audio_level,          0, 1, 0.05f, 0, NULL, 0, 2 },
+    { "rx_fmin",  CI_FLOAT, &cfg.rx_f_min,             0, 3000, 50, 0, NULL, 0, 0 },
+    { "rx_fmax",  CI_FLOAT, &cfg.rx_f_max,           100, 5000, 50, 0, NULL, 0, 0 },
+    { "cand",     CI_INT,   &cfg.max_candidates,      10, 140, 5, 0, NULL, 0, 0 },
+    { "ldpc_it",  CI_INT,   &cfg.ldpc_iterations,      5, 100, 5, 0, NULL, 0, 0 },
+    { "parse_ms", CI_U32,   &cfg.rx_parse_ms,       1500, 5000, 100, 0, NULL, 0, 0 },
+    { "qso_en",   CI_BOOL,  &cfg.qso.enable,           0,0,0, 0, NULL, 0, 0 },
+    { "qso_cq",   CI_BOOL,  &cfg.qso.cq_mode,          0,0,0, 0, NULL, 0, 0 },
+    { "qso_rty",  CI_INT,   &cfg.qso.max_retries,      1, 20, 1, 0, NULL, 0, 0 },
+    { "qso_to",   CI_STR,   cfg.qso.target_callsign,   0,0,0, sizeof(cfg.qso.target_callsign), NULL, 0, 0 },
+};
+#define CI_N ((int)(sizeof(s_ci) / sizeof(s_ci[0])))
+
+static int s_ci_sel = 0;
+static int s_ci_scroll = 0;
+static int s_ci_cursor = 0;
+static const char s_ci_charset[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/.-";
+
+static void ci_adjust(const ci_item_t *it, int dir)
+{
+    switch (it->type) {
+    case CI_BOOL:
+        *(bool *)it->ptr = !*(bool *)it->ptr;
+        break;
+    case CI_INT: {
+        int v = *(int *)it->ptr + dir * (int)it->step;
+        if (v < (int)it->vmin) v = (int)it->vmin;
+        if (v > (int)it->vmax) v = (int)it->vmax;
+        *(int *)it->ptr = v;
+        break;
+    }
+    case CI_U32: {
+        int v = (int)*(uint32_t *)it->ptr + dir * (int)it->step;
+        if (v < (int)it->vmin) v = (int)it->vmin;
+        if (v > (int)it->vmax) v = (int)it->vmax;
+        *(uint32_t *)it->ptr = (uint32_t)v;
+        break;
+    }
+    case CI_FLOAT: {
+        float v = *(float *)it->ptr + dir * it->step;
+        if (v < it->vmin) v = it->vmin;
+        if (v > it->vmax) v = it->vmax;
+        *(float *)it->ptr = v;
+        break;
+    }
+    case CI_ENUM: {
+        int v = *(int *)it->ptr + dir;
+        if (v < 0) v = it->nopts - 1;
+        if (v >= it->nopts) v = 0;
+        *(int *)it->ptr = v;
+        break;
+    }
+    case CI_STR: {
+        char *s = (char *)it->ptr;
+        int len = it->len;
+        int cur = s_ci_cursor;
+        if (cur < 0) cur = 0;
+        if (cur >= len - 1) cur = len - 2;
+        const char *p = strchr(s_ci_charset, s[cur]);
+        int idx = p ? (int)(p - s_ci_charset) : 0;
+        int setn = (int)strlen(s_ci_charset);
+        idx = (idx + dir + setn) % setn;
+        s[cur] = s_ci_charset[idx];
+        if (s[cur] && cur + 1 < len && s[cur + 1] == '\0') s[cur + 1] = '\0';
+        break;
+    }
+    default: break;
+    }
+}
+
+static void ci_key(key_id_t k)
+{
+    const ci_item_t *it = &s_ci[s_ci_sel];
+    switch (k) {
+    case KEY_ID_UP:    if (s_ci_sel > 0) s_ci_sel--; break;
+    case KEY_ID_DOWN:  if (s_ci_sel < CI_N - 1) s_ci_sel++; break;
+    case KEY_ID_LEFT:  ci_adjust(it, -1); break;
+    case KEY_ID_RIGHT: ci_adjust(it, +1); break;
+    case KEY_ID_MID:
+        if (it->type == CI_STR) {
+            s_ci_cursor = (s_ci_cursor + 1) % (it->len - 1);
+        }
+        break;
+    default: break;
+    }
+    if (s_ci_sel < s_ci_scroll) s_ci_scroll = s_ci_sel;
+    if (s_ci_sel >= s_ci_scroll + 9) s_ci_scroll = s_ci_sel - 8;
+}
+
+static void draw_page_cfg_set(void)
+{
+    lcd_row(0, CYAN, "CFG SET %d/%d", s_ci_sel + 1, CI_N);
+    for (int r = 0; r < 9; r++) {
+        int i = s_ci_scroll + r;
+        if (i >= CI_N) break;
+        const ci_item_t *it = &s_ci[i];
+        const char *pre = (i == s_ci_sel) ? ">" : " ";
+        uint16_t col = (i == s_ci_sel) ? YELLOW : WHITE;
+        switch (it->type) {
+        case CI_BOOL:  lcd_row(1 + r, col, "%s%s %s", pre, it->name, *(bool *)it->ptr ? "Y" : "N"); break;
+        case CI_INT:   lcd_row(1 + r, col, "%s%s %d", pre, it->name, *(int *)it->ptr); break;
+        case CI_U32:   lcd_row(1 + r, col, "%s%s %lu", pre, it->name, (unsigned long)*(uint32_t *)it->ptr); break;
+        case CI_FLOAT: lcd_row(1 + r, col, "%s%s %.*f", pre, it->name, it->dec, (double)*(float *)it->ptr); break;
+        case CI_STR:   lcd_row(1 + r, col, "%s%s %s", pre, it->name, (char *)it->ptr); break;
+        case CI_ENUM: {
+            int v = *(int *)it->ptr;
+            if (v < 0 || v >= it->nopts) v = 0;
+            lcd_row(1 + r, col, "%s%s %s", pre, it->name, it->opts[v]);
+            break;
+        }
+        default: break;
+        }
+    }
+}
 
 /* ================= LCD 主任务 ================= */
-#define LCD_PAGE_NUM    4                  /* 页数: 0=信息 1=卫星 2=信号 3=瀑布 */
+#define LCD_PAGE_NUM    8                  /* 页数: 0信息 1卫星 2信号 3频谱 4RX 5TX 6日志 7配置 */
 static volatile int s_lcd_page = 0;        /* 当前显示页, 由按键回调修改 */
 
 static void LCD_task(void *arg)
@@ -410,7 +667,10 @@ static void LCD_task(void *arg)
         else if (page == 1) draw_page_sat(&g);      //gps卫星明细
         else if (page == 2) draw_page_signal(g);    //gps信号强度
         else if (page == 3) draw_page_fft();        //频谱
-
+        else if (page == 4) draw_page_RX();         //接收到的信号解码信息
+        else if (page == 5) draw_page_TX();         //发送的信号(设置选择)
+        else if (page == 6) draw_page_log();        //日志信息查看
+        else if (page == 7) draw_page_cfg_set();    //配置设置, 可设置 cfg 所有内容
 
         LCD_Flush();                       /* 画完一整帧后一次性推送 */
 
@@ -486,33 +746,63 @@ static void gps_time_task(void *arg)
 
 static void my_key_callback(key_id_t key_id, key_event_t event, void *user_data)
 {
-    /* 单击: 上/下/左/右 翻页, 中间键回首页 */
-    if (event == KEY_EVENT_CLICK)
-    {
-        ESP_LOGI("APP", "按键 %d 单击", key_id);
-        switch (key_id)
-        {
-        case KEY_ID_UP:
-        case KEY_ID_LEFT:
-            s_lcd_page = (s_lcd_page + LCD_PAGE_NUM - 1) % LCD_PAGE_NUM;
-            ESP_LOGI("APP", "按键翻页 -> %d", s_lcd_page);
-            break;
-        case KEY_ID_DOWN:
-        case KEY_ID_RIGHT:
-            s_lcd_page = (s_lcd_page + 1) % LCD_PAGE_NUM;
-            ESP_LOGI("APP", "按键翻页 -> %d", s_lcd_page);
-            break;
-        case KEY_ID_MID:
-            s_lcd_page = 0;
-            ESP_LOGI("APP", "按键返回首页");
-            break;
-        default:
-            break;
-        }
+    if (event == KEY_EVENT_LONG_PRESS) {
+        ESP_LOGI("APP", "按键 %d 长按", key_id);
+        return;
     }
-    else if (event == KEY_EVENT_LONG_PRESS)
-    {
-        ESP_LOGI("APP", "按键 %d 长按 ", key_id);
+    if (event != KEY_EVENT_CLICK) return;
+
+    int page = s_lcd_page;
+
+    /* SET=上一页, RST=下一页 */
+    if (key_id == KEY_ID_SET) {
+        s_lcd_page = (page + LCD_PAGE_NUM - 1) % LCD_PAGE_NUM;
+        ESP_LOGI("APP", "SET 上一页 -> %d", s_lcd_page);
+        return;
+    }
+    if (key_id == KEY_ID_RST) {
+        s_lcd_page = (page + 1) % LCD_PAGE_NUM;
+        ESP_LOGI("APP", "RST 下一页 -> %d", s_lcd_page);
+        return;
+    }
+
+    if (page == 5) {                       /* TX 设置页: 上下选, 左右调, 中移光标 */
+        if (key_id == KEY_ID_UP)        { if (s_tx_sel > 0) s_tx_sel--; }
+        else if (key_id == KEY_ID_DOWN) { if (s_tx_sel < TX_SEL_N - 1) s_tx_sel++; }
+        else if (key_id == KEY_ID_LEFT)  tx_adjust(-1);
+        else if (key_id == KEY_ID_RIGHT) tx_adjust(+1);
+        else if (key_id == KEY_ID_MID && s_tx_sel == 1)
+            s_tx_cursor = (s_tx_cursor + 1) % (int)(sizeof(cfg.tx.call_to) - 1);
+        return;
+    }
+
+    if (page == 6) {                       /* 日志页: 上下滚动 */
+        if (key_id == KEY_ID_UP)        s_log_scroll++;
+        else if (key_id == KEY_ID_DOWN) s_log_scroll--;
+        if (s_log_scroll < 0) s_log_scroll = 0;
+        return;
+    }
+
+    if (page == 7) {                       /* 配置页 */
+        ci_key(key_id);
+        return;
+    }
+
+    /* 其它页: 上/左上一页, 下/右下一页, 中回首页 */
+    switch (key_id) {
+    case KEY_ID_UP:
+    case KEY_ID_LEFT:
+        s_lcd_page = (page + LCD_PAGE_NUM - 1) % LCD_PAGE_NUM;
+        break;
+    case KEY_ID_DOWN:
+    case KEY_ID_RIGHT:
+        s_lcd_page = (page + 1) % LCD_PAGE_NUM;
+        break;
+    case KEY_ID_MID:
+        s_lcd_page = 0;
+        break;
+    default:
+        break;
     }
 }
 

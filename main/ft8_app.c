@@ -518,6 +518,29 @@ static float rx_measure_snr(const ftx_waterfall_t *wf, const ftx_candidate_t *ca
 }
 
 /* ============================================================
+ * 最近解码消息环形缓冲(供 LCD 的 RX 页显示, 无锁)
+ * ============================================================ */
+static ft8_rx_log_t s_rx_log;
+
+static void rxlog_add(const char *text, float freq_hz, float snr_db, int64_t slot)
+{
+    if (text == NULL) return;
+    ft8_rx_msg_t *m = &s_rx_log.msgs[s_rx_log.put];
+    strncpy(m->text, text, sizeof(m->text) - 1);
+    m->text[sizeof(m->text) - 1] = '\0';
+    m->freq_hz = freq_hz;
+    m->snr_db  = snr_db;
+    m->slot    = slot;
+    s_rx_log.put = (s_rx_log.put + 1) % FT8_RX_MSG_MAX;
+    s_rx_log.seq++;
+}
+
+const ft8_rx_log_t *ft8_rx_log(void)
+{
+    return &s_rx_log;
+}
+
+/* ============================================================
  * RX：整窗解析一个时隙(带解码耗时预算，避免拖入下一时隙采集)
  * ============================================================ */
 static void rx_decode_slot(monitor_t *mon, int64_t prev_slot, int64_t budget_us)
@@ -600,6 +623,9 @@ static void rx_decode_slot(monitor_t *mon, int64_t prev_slot, int64_t budget_us)
 
         /* 投递给自动 QSO 引擎(启用时才建队, 无队则此调用为空操作) */
         qso_rx_publish(&msg, f_hz, snr_db, prev_slot);
+
+        /* 存入最近解码环形(供 LCD RX 页) */
+        rxlog_add(text, f_hz, snr_db, prev_slot);
 
         s_stat_decoded++;
         ESP_LOGI(T, "[RX] %s @%0.0fHz t=%0.2fs SNR=%s: %s",

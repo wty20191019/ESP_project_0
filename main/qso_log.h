@@ -20,6 +20,13 @@ esp_err_t qso_log_init(bool usb_mount);
 /** ft8_app QSO 完成回调: 追加一条 ADIF 记录(签名匹配 ft8_qso_callback_t) */
 void qso_log_on_qso(const ft8_qso_record_t *rec, void *arg);
 
+/* ---- 最近 QSO 摘要(RAM 环形, 供 LCD 日志页显示) ---- */
+#define QSO_LOG_RAM_MAX 16
+/** 取第 idx 条摘要(idx 0 = 最新); 越界返回 NULL */
+const char *qso_log_line(int idx);
+/** 当前缓存条数 */
+int qso_log_lines(void);
+
 #ifdef __cplusplus
 }
 #endif

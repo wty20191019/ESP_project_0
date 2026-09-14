@@ -48,6 +48,24 @@ typedef struct {
  */
 const ft8_wf_snap_t *ft8_wf_snap(void);
 
+/* ---- 最近解码消息(供 LCD 的 RX 页显示) ---- */
+#define FT8_RX_MSG_MAX 16
+typedef struct {
+    char     text[40];      /*!< 解码文本 */
+    float    freq_hz;       /*!< 音频频率 */
+    float    snr_db;        /*!< 估算 SNR(NAN=未知) */
+    int64_t  slot;          /*!< 所在时隙号 */
+} ft8_rx_msg_t;
+
+typedef struct {
+    volatile uint32_t seq;  /*!< 每新增一条 +1 */
+    volatile uint32_t put;  /*!< 下一条写入下标; 最新 = (put-1+MAX)%MAX */
+    ft8_rx_msg_t msgs[FT8_RX_MSG_MAX];
+} ft8_rx_log_t;
+
+/** 取最近解码消息环形缓冲(无锁) */
+const ft8_rx_log_t *ft8_rx_log(void);
+
 /**
  * 发射消息类型：标准一次通联的 6 类内容。
  * 文本一律以本机(呼号=callsign)为发送方视角拼接，格式为：
