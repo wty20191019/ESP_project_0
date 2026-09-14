@@ -497,7 +497,7 @@ static int s_log_detail = 0;
 static void draw_page_log(void)
 {
     /* 约每 1s 重新读取一次文件尾部(读失败保留旧内容) */
-    if ((s_log_tick++ % 50) == 0) qso_log_tail(QSO_TAIL_MAX);
+    if ((s_log_tick++ % 50) == 0) qso_log_tail(0);   /* 0 = 读取全部记录 */
 
     int n = qso_log_tail_count();
 

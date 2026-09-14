@@ -27,9 +27,9 @@ const char *qso_log_line(int idx);
 /** 当前缓存条数 */
 int qso_log_lines(void);
 
-/* ---- 直接读取 /storage/log.txt 尾部若干行(供日志页浏览文件内容) ---- */
-#define QSO_TAIL_MAX 32
-#define QSO_LINE_MAX 320      /* 单行 ADIF 最大长度(要能装下完整一行, 否则会被拆行) */
+/* ---- 直接读取 /storage/log.txt 尾部行(供日志页浏览文件内容) ---- */
+#define QSO_LINE_MAX 512      /* 单行 ADIF 最大长度 */
+/* 只缓存解析摘要+文件偏移, 详情按需读文件; 数组按需在 PSRAM 动态增长, 不设条数上限 */
 
 /* 从 ADIF 行解析出的摘要(呼号/网格/信号/频率/时间) */
 typedef struct {
@@ -41,8 +41,9 @@ typedef struct {
 } qso_log_sum_t;
 
 /**
- * @brief 读取 log.txt 最后 max_lines 行到内部缓冲(最多 QSO_TAIL_MAX 行), 并解析摘要。
+ * @brief 读取 log.txt 尾部若干行到内部缓冲, 并解析摘要(数组按需在 PSRAM 动态增长)。
  *        读失败(如被 USB 主机占用)时保留上次内容。
+ * @param max_lines >0 只保留最后 max_lines 条; <=0 读取全部
  * @return 当前缓冲行数
  */
 int qso_log_tail(int max_lines);

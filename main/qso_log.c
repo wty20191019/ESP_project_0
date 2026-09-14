@@ -24,6 +24,7 @@
 #include "esp_partition.h"
 #include "wear_levelling.h"
 #include "esp_vfs_fat.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -71,9 +72,35 @@ static void qso_log_ram_add(const ft8_qso_record_t *rec)
 }
 
 /* ---------------- 读取 log.txt 尾部行 ---------------- */
-static char s_tail[QSO_TAIL_MAX][QSO_LINE_MAX];
-static qso_log_sum_t s_tail_sum[QSO_TAIL_MAX];
-static int  s_tail_n = 0;
+/* 只缓存摘要 + 文件偏移; 数组在 PSRAM 动态增长, 不设条数上限 */
+static qso_log_sum_t *s_sums = NULL;
+static long          *s_offs = NULL;
+static int            s_cap  = 0;
+static int            s_tail_n = 0;
+static char           s_detail[QSO_LINE_MAX];    /* 详情按需读入 */
+static int            s_detail_idx = -1;
+
+static bool tail_reserve(int need)
+{
+    if (need <= s_cap) return true;
+    int cap = s_cap ? s_cap : 256;
+    while (cap < need) cap *= 2;
+
+    qso_log_sum_t *ns = heap_caps_realloc(s_sums, (size_t)cap * sizeof(*ns),
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ns == NULL) ns = realloc(s_sums, (size_t)cap * sizeof(*ns));
+    if (ns == NULL) return false;
+    s_sums = ns;
+
+    long *no = heap_caps_realloc(s_offs, (size_t)cap * sizeof(*no),
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (no == NULL) no = realloc(s_offs, (size_t)cap * sizeof(*no));
+    if (no == NULL) return false;
+    s_offs = no;
+
+    s_cap = cap;
+    return true;
+}
 
 /* 从 ADIF 行取某标签的值(如 call/gridsquare/rst_rcvd/freq) */
 static void adif_field(const char *line, const char *tag, char *out, size_t cap)
@@ -117,13 +144,26 @@ static void adif_parse_sum(const char *line, qso_log_sum_t *s)
 const char *qso_log_tail_line(int idx)
 {
     if (idx < 0 || idx >= s_tail_n) return NULL;
-    return s_tail[idx];
+    if (idx != s_detail_idx) {
+        FILE *f = fopen(QSO_LOG_PATH, "r");
+        if (f == NULL) return NULL;
+        if (fseek(f, s_offs[idx], SEEK_SET) != 0 ||
+            fgets(s_detail, sizeof(s_detail), f) == NULL) {
+            fclose(f);
+            return NULL;
+        }
+        fclose(f);
+        size_t l = strlen(s_detail);
+        while (l > 0 && (s_detail[l - 1] == '\n' || s_detail[l - 1] == '\r')) s_detail[--l] = '\0';
+        s_detail_idx = idx;
+    }
+    return s_detail;
 }
 
 const qso_log_sum_t *qso_log_tail_summary(int idx)
 {
     if (idx < 0 || idx >= s_tail_n) return NULL;
-    return &s_tail_sum[idx];
+    return &s_sums[idx];
 }
 
 int qso_log_tail_count(void)
@@ -133,36 +173,34 @@ int qso_log_tail_count(void)
 
 int qso_log_tail(int max_lines)
 {
-    if (max_lines <= 0) max_lines = QSO_TAIL_MAX;
-    if (max_lines > QSO_TAIL_MAX) max_lines = QSO_TAIL_MAX;
-
     FILE *f = fopen(QSO_LOG_PATH, "r");
     if (f == NULL) return s_tail_n;     /* 被主机占用等: 保留旧内容 */
 
-    /* 滚动窗口: 始终保留最后 max_lines 行(原文 + 解析摘要) */
     char buf[QSO_LINE_MAX];
     int n = 0;
-    while (fgets(buf, sizeof(buf), f)) {
+    for (;;) {
+        long off = ftell(f);
+        if (fgets(buf, sizeof(buf), f) == NULL) break;
         size_t l = strlen(buf);
         while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = '\0';
-        if (n < max_lines) {
-            strncpy(s_tail[n], buf, QSO_LINE_MAX - 1);
-            s_tail[n][QSO_LINE_MAX - 1] = '\0';
-            adif_parse_sum(s_tail[n], &s_tail_sum[n]);
-            n++;
-        } else {
+        if (buf[0] != '<') continue;    /* 超长行被拆出的续段(非 ADIF 行首), 跳过 */
+
+        if (max_lines > 0 && n >= max_lines) {
             for (int i = 1; i < max_lines; i++) {
-                memcpy(s_tail[i - 1], s_tail[i], sizeof(s_tail[0]));
-                s_tail_sum[i - 1] = s_tail_sum[i];
+                s_sums[i - 1] = s_sums[i];
+                s_offs[i - 1] = s_offs[i];
             }
-            strncpy(s_tail[max_lines - 1], buf, QSO_LINE_MAX - 1);
-            s_tail[max_lines - 1][QSO_LINE_MAX - 1] = '\0';
-            adif_parse_sum(s_tail[max_lines - 1], &s_tail_sum[max_lines - 1]);
+            n = max_lines - 1;
         }
+        if (!tail_reserve(n + 1)) break;    /* 内存不足则停 */
+        s_offs[n] = off;
+        adif_parse_sum(buf, &s_sums[n]);
+        n++;
     }
     fclose(f);
 
     s_tail_n = n;
+    s_detail_idx = -1;                  /* 偏移已变, 详情缓存失效 */
     return s_tail_n;
 }
 
@@ -361,7 +399,7 @@ void qso_log_on_qso(const ft8_qso_record_t *rec, void *arg)
     else
         snprintf(comment, sizeof(comment), "QSO by ESP32-FT8");
 
-    char line[320];
+    char line[QSO_LINE_MAX];
     line[0] = '\0';
     int p = 0;
     p = adif_add(line, p, sizeof(line), "call",             rec->call);
@@ -380,9 +418,10 @@ void qso_log_on_qso(const ft8_qso_record_t *rec, void *arg)
     p = adif_add(line, p, sizeof(line), "station_callsign", rec->station_callsign);
     p = adif_add(line, p, sizeof(line), "my_gridsquare",    rec->my_grid);
     p = adif_add(line, p, sizeof(line), "comment",          comment);
-    if (p < (int)sizeof(line) - 8)
-        p += snprintf(line + p, sizeof(line) - (size_t)p, "<eor>\n");
-    if (p >= (int)sizeof(line)) p = (int)sizeof(line) - 1;
+
+    /* 预留 <eor>\n 的位置, 保证每条记录一定以换行结束(否则会与下一条粘行) */
+    if (p > (int)sizeof(line) - 7) p = (int)sizeof(line) - 7;
+    p += snprintf(line + p, sizeof(line) - (size_t)p, "<eor>\n");
     line[p] = '\0';
 
     FILE *f = fopen(QSO_LOG_PATH, "a");
