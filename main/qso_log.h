@@ -28,14 +28,16 @@ const char *qso_log_line(int idx);
 int qso_log_lines(void);
 
 /* ---- 直接读取 /storage/log.txt 尾部若干行(供日志页浏览文件内容) ---- */
-#define QSO_TAIL_MAX 48
+#define QSO_TAIL_MAX 32
+#define QSO_LINE_MAX 320      /* 单行 ADIF 最大长度(要能装下完整一行, 否则会被拆行) */
 
-/* 从 ADIF 行解析出的摘要(呼号/网格/信号/频率) */
+/* 从 ADIF 行解析出的摘要(呼号/网格/信号/频率/时间) */
 typedef struct {
     char call[16];
     char grid[8];
     char rst[8];
     char freq[12];
+    char time[8];      /* UTC 结束时间 HHMMSS */
 } qso_log_sum_t;
 
 /**

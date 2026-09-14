@@ -57,6 +57,26 @@ static void lcd_row(int row, uint16_t color, const char *fmt, ...)
     LCD_ShowString(0, y, (const uint8_t *)b, color, BLACK, 16, 0);
 }
 
+/* 指定字号与 y 坐标的整行绘制(size: 12/16/24/32), 自动清底并截断 */
+static void lcd_line(int y, uint16_t color, uint8_t size, const char *fmt, ...)
+{
+    if (y < 0 || y + size > LCD_H) return;
+
+    char b[64];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(b) - 1) n = (int)sizeof(b) - 1;
+    int maxc = LCD_W / (size / 2);          /* 该字号最多字符数 */
+    if (n > maxc) n = maxc;
+    b[n] = '\0';
+
+    LCD_Fill(0, (uint16_t)y, LCD_W, (uint16_t)(y + size), BLACK);
+    LCD_ShowString(0, (uint16_t)y, (const uint8_t *)b, color, BLACK, size, 0);
+}
+
 /* 星座中文含义 -> 短名称 */
 static const char *sys_name(uint8_t id)
 {
@@ -465,12 +485,14 @@ static void draw_page_gps(const gps_info_t *g)
     lcd_row(9, WHITE, "PPS#%lu", (unsigned long)g->pps_seq);
 }
 
-/* ================= 页 3 日志(呼号/网格/信号/频率, 中键看原文详情) ================= */
-static int s_log_sel = 9999;       /* 选中行(0=最旧), 初始贴最新 */
-static int s_log_top = 9999;       /* 列表顶部行 */
+/* ================= 页 3 日志(呼号/网格/信号/频率, 每条 2 行; 中键看原文详情) ================= */
+static int s_log_sel = 9999;       /* 选中记录(0=最旧), 初始贴最新 */
+static int s_log_top = 9999;       /* 列表顶部记录 */
 static int s_log_hscroll = 0;
 static int s_log_tick = 0;
 static int s_log_detail = 0;
+
+#define LOG_VIS_ROWS 6                 /* 一屏 6 条(每条 2 行小字) */
 
 static void draw_page_log(void)
 {
@@ -500,15 +522,16 @@ static void draw_page_log(void)
     if (s_log_top > n - 1) s_log_top = n - 1;
     if (s_log_top < 0) s_log_top = 0;
     if (s_log_sel < s_log_top) s_log_top = s_log_sel;
-    if (s_log_sel > s_log_top + 8) s_log_top = s_log_sel - 8;
+    if (s_log_sel > s_log_top + (LOG_VIS_ROWS - 1)) s_log_top = s_log_sel - (LOG_VIS_ROWS - 1);
 
-    for (int r = 0; r < 9; r++) {
-        int k = s_log_top + r;
-        if (k >= n) { lcd_row(1 + r, GRAY, ""); continue; }
-        const qso_log_sum_t *s = qso_log_tail_summary(k);
-        if (s == NULL) { lcd_row(1 + r, GRAY, ""); continue; }
-        lcd_row(1 + r, (k == s_log_sel) ? YELLOW : WHITE,
-                "%s %s %s %.5s", s->call, s->grid, s->rst, s->freq);
+    for (int i = 0; i < LOG_VIS_ROWS; i++) {
+        int k = s_log_top + i;
+        int y = 16 + i * 24;                 /* 每条 24px: 两行 12px 小字 */
+        const qso_log_sum_t *s = (k < n) ? qso_log_tail_summary(k) : NULL;
+        if (s == NULL) { LCD_Fill(0, (uint16_t)y, LCD_W, (uint16_t)(y + 24), BLACK); continue; }
+        uint16_t col = (k == s_log_sel) ? YELLOW : WHITE;
+        lcd_line(y,      col, 12, "%s", s->call);                     /* 呼号 */
+        lcd_line(y + 12, col, 12, "%s %s %s", s->grid, s->rst, s->freq); /* 网格 信号 频率 */
     }
 }
 

@@ -71,7 +71,7 @@ static void qso_log_ram_add(const ft8_qso_record_t *rec)
 }
 
 /* ---------------- 读取 log.txt 尾部行 ---------------- */
-static char s_tail[QSO_TAIL_MAX][128];
+static char s_tail[QSO_TAIL_MAX][QSO_LINE_MAX];
 static qso_log_sum_t s_tail_sum[QSO_TAIL_MAX];
 static int  s_tail_n = 0;
 
@@ -95,6 +95,8 @@ static void adif_field(const char *line, const char *tag, char *out, size_t cap)
     v++;
     if (len < 0) len = 0;
     size_t n = (size_t)len;
+    size_t avail = strlen(v);           /* 不能超过该行剩余长度, 否则越界读到换行/垃圾 */
+    if (n > avail) n = avail;
     if (n >= cap) n = cap - 1;
     memcpy(out, v, n);
     out[n] = '\0';
@@ -107,6 +109,9 @@ static void adif_parse_sum(const char *line, qso_log_sum_t *s)
     adif_field(line, "gridsquare", s->grid, sizeof(s->grid));
     adif_field(line, "rst_rcvd",   s->rst,  sizeof(s->rst));
     adif_field(line, "freq",       s->freq, sizeof(s->freq));
+    adif_field(line, "time_off",   s->time, sizeof(s->time));
+    if (s->time[0] == '\0')
+        adif_field(line, "time_on", s->time, sizeof(s->time));
 }
 
 const char *qso_log_tail_line(int idx)
@@ -135,14 +140,14 @@ int qso_log_tail(int max_lines)
     if (f == NULL) return s_tail_n;     /* 被主机占用等: 保留旧内容 */
 
     /* 滚动窗口: 始终保留最后 max_lines 行(原文 + 解析摘要) */
-    char buf[128];
+    char buf[QSO_LINE_MAX];
     int n = 0;
     while (fgets(buf, sizeof(buf), f)) {
         size_t l = strlen(buf);
         while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = '\0';
         if (n < max_lines) {
-            strncpy(s_tail[n], buf, sizeof(s_tail[0]) - 1);
-            s_tail[n][sizeof(s_tail[0]) - 1] = '\0';
+            strncpy(s_tail[n], buf, QSO_LINE_MAX - 1);
+            s_tail[n][QSO_LINE_MAX - 1] = '\0';
             adif_parse_sum(s_tail[n], &s_tail_sum[n]);
             n++;
         } else {
@@ -150,8 +155,8 @@ int qso_log_tail(int max_lines)
                 memcpy(s_tail[i - 1], s_tail[i], sizeof(s_tail[0]));
                 s_tail_sum[i - 1] = s_tail_sum[i];
             }
-            strncpy(s_tail[max_lines - 1], buf, sizeof(s_tail[0]) - 1);
-            s_tail[max_lines - 1][sizeof(s_tail[0]) - 1] = '\0';
+            strncpy(s_tail[max_lines - 1], buf, QSO_LINE_MAX - 1);
+            s_tail[max_lines - 1][QSO_LINE_MAX - 1] = '\0';
             adif_parse_sum(s_tail[max_lines - 1], &s_tail_sum[max_lines - 1]);
         }
     }
