@@ -712,7 +712,7 @@ typedef struct {
     int         dec;                 /* 浮点显示小数位 */
 } ci_item_t;
 
-static const char *const s_proto_opts[] = { "FT8", "FT4" };
+static const char *const s_proto_opts[] = { "FT4", "FT8" };
 
 static const ci_item_t s_ci[] = {
     { "callsign", CI_STR,   cfg.callsign,              0,0,0, sizeof(cfg.callsign), NULL, 0, 0 },
@@ -991,7 +991,7 @@ static void LCD_task(void *arg)
 }
 
 /* ================= RGB LED 呼吸灯 ================= */
-static void rgb_led_task(void *arg)
+static void rgb_led_task_0(void *arg)
 {
     static uint8_t res = 0;
     if (res == 0)
@@ -1012,6 +1012,32 @@ static void rgb_led_task(void *arg)
         /* 蓝色呼吸 */
         for (int i = 0; i <= 255; i += 5) { led_set_rgb(0, 0, i); vTaskDelay(pdMS_TO_TICKS(5)); }
         for (int i = 255; i > 0; i -= 5)  { led_set_rgb(0, 0, i); vTaskDelay(pdMS_TO_TICKS(5)); }
+    }
+}
+
+
+
+
+/* ================= RGB LED 状态灯 ================= */
+static void rgb_led_task(void *arg)
+{
+    static uint8_t res = 0;
+    if (res == 0)
+    {
+        led_init();
+        ESP_LOGI(TAG, "RGB LED 状态灯任务启动");
+        res = 1;
+    }
+
+    bool on = false;
+    for (;;)
+    {
+        /* 发射时隙=红, 接收时隙=绿; 每 20ms 翻转闪动 */
+        bool tx_slot = ft8_app_in_tx_slot();
+        if (on) led_set_rgb(tx_slot ? 0xFF : 0, tx_slot ? 0 : 0xFF, 0);
+        else    led_set_rgb(0, 0, 0);
+        on = !on;
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 

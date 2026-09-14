@@ -557,6 +557,17 @@ bool ft8_app_tx_busy(void)
     return s_tx_busy;
 }
 
+bool ft8_app_in_tx_slot(void)
+{
+    if (s_cfg_p == NULL) return false;
+    utc_try_lock_gps();
+    utc_ref_t ref;
+    utc_ref_get(&ref);
+    int64_t now = esp_timer_get_time();
+    int64_t slot = utc_to_us(&ref, now) / app_slot_us();
+    return ((int)(slot & 1)) == (s_cfg.tx_slot_parity & 1);
+}
+
 /* ============================================================
  * RX：整窗解析一个时隙(带解码耗时预算，避免拖入下一时隙采集)
  * ============================================================ */
