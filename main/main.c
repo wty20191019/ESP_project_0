@@ -13,10 +13,12 @@
 #include <string.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "ft8_app.h"
+#include "qso_log.h"
 #include "led.h"
 #include "lcd.h"
 #include "gps.h"
@@ -53,6 +55,46 @@ static void lcd_row(int row, uint16_t color, const char *fmt, ...)
     uint16_t y = (uint16_t)(row * LCD_ROW_H);
     LCD_Fill(0, y, LCD_W, y + LCD_ROW_H, BLACK);
     LCD_ShowString(0, y, (const uint8_t *)b, color, BLACK, 16, 0);
+}
+
+/* 指定字号与 y 坐标的整行绘制(size: 12/16/24/32), 自动清底并截断 */
+static void lcd_line(int y, uint16_t color, uint8_t size, const char *fmt, ...)
+{
+    if (y < 0 || y + size > LCD_H) return;
+
+    char b[64];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(b) - 1) n = (int)sizeof(b) - 1;
+    int maxc = LCD_W / (size / 2);          /* 该字号最多字符数 */
+    if (n > maxc) n = maxc;
+    b[n] = '\0';
+
+    LCD_Fill(0, (uint16_t)y, LCD_W, (uint16_t)(y + size), BLACK);
+    LCD_ShowString(0, (uint16_t)y, (const uint8_t *)b, color, BLACK, size, 0);
+}
+
+/* 同 lcd_line, 但可指定背景色(用于选中反色) */
+static void lcd_line_bg(int y, uint8_t size, uint16_t fc, uint16_t bc, const char *fmt, ...)
+{
+    if (y < 0 || y + size > LCD_H) return;
+
+    char b[64];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    if (n < 0) n = 0;
+    if (n > (int)sizeof(b) - 1) n = (int)sizeof(b) - 1;
+    int maxc = LCD_W / (size / 2);
+    if (n > maxc) n = maxc;
+    b[n] = '\0';
+
+    LCD_Fill(0, (uint16_t)y, LCD_W, (uint16_t)(y + size), bc);
+    LCD_ShowString(0, (uint16_t)y, (const uint8_t *)b, fc, bc, size, 0);
 }
 
 /* 星座中文含义 -> 短名称 */
@@ -145,7 +187,7 @@ static void build_sys_counts(const gps_info_t *g, char *out, size_t cap)
     }
 }
 
-/* ================= 三页显示 ================= */
+/* ================= 显示 ================= */
 
 /* 第 0 页: 时间 / 日期 / 经纬 / 卫星汇总 / 基本状态 */
 static void draw_page_info(const gps_info_t *src)
@@ -307,51 +349,35 @@ static uint16_t wf_color(uint8_t rel)
     return s_wf_lut[rel];
 }
 
-/* 第 3 页: 瀑布图。最新一行贴屏幕底部, 历史向上滚动。
- * 数据源: ft8_app RX 任务每收到一个符号块, 就把该块功率谱压缩成一行
- * 128 点写入环形快照(见 ft8_app.h 的 ft8_wf_snap_t / ft8_wf_snap)。 */
-static void draw_page_fft(void)
+static const char *const s_msg_opts[] = { "CQ", "CALL", "REPORT", "R_REPORT", "RRR", "RR73", "73" };
+
+/* ================= 瀑布绘制(通用区域) =================
+ * 把 wf 快照最近 h 行画到 x=0..127, y0..y0+h-1, 最新行贴底部;
+ * 逐帧直方图自适应拉伸 + 颜色游程填充。 */
+static void draw_waterfall(int y0, int h)
 {
-    char buf[40];
-    snprintf(buf, sizeof(buf), "WF %.3g-%.3gk",
-             (double)cfg.rx_f_min / 1000.0, (double)cfg.rx_f_max / 1000.0);
-    lcd_row(0, CYAN, "%s", buf);
-
     const ft8_wf_snap_t *wf = ft8_wf_snap();
-    if (wf == NULL || wf->seq == 0) {
-        lcd_row(4, GRAY, "NO DATA");
-        lcd_row(5, GRAY, "wait rx...");
-        return;
-    }
+    if (wf == NULL || wf->seq == 0 || h <= 0) return;
 
-    const uint32_t seq = wf->seq;              /* 一次性读取, 容忍极轻微跨核竞态 */
     const uint32_t put = wf->put;
-    uint32_t n = (seq < FT8_WF_ROWS) ? seq : FT8_WF_ROWS;
+    uint32_t avail = (wf->seq < FT8_WF_ROWS) ? wf->seq : FT8_WF_ROWS;
+    uint32_t n = (avail < (uint32_t)h) ? avail : (uint32_t)h;
+    if (n == 0) return;
     uint32_t oldest = ((put - n) % FT8_WF_ROWS + FT8_WF_ROWS) % FT8_WF_ROWS;
 
-    /* ---- 第一遍: 直方图, 定"噪声底"(中位数 lo)与"顶"(最大值 hi) ----
-     * 逐帧自适应拉伸, 避免绝对阈值把整屏压在蓝/青段而没有其它颜色。 */
     uint16_t hist[256] = { 0 };
     for (uint32_t k = 0; k < n; k++) {
         const uint8_t *row = wf->rows[(oldest + k) % FT8_WF_ROWS];
-        for (int x = 0; x < FT8_WF_COLS; x++)
-            hist[row[x]]++;
+        for (int x = 0; x < FT8_WF_COLS; x++) hist[row[x]]++;
     }
     const uint32_t total = n * FT8_WF_COLS;
-
     int acc = 0, lo = 0;
-    for (int i = 0; i < 256; i++) {
-        acc += hist[i];
-        if (acc * 2 >= (int)total) { lo = i; break; }
-    }
+    for (int i = 0; i < 256; i++) { acc += hist[i]; if (acc * 2 >= (int)total) { lo = i; break; } }
     int hi = 0;
-    for (int i = 255; i >= 0; i--) {
-        if (hist[i]) { hi = i; break; }
-    }
+    for (int i = 255; i >= 0; i--) if (hist[i]) { hi = i; break; }
     int span = hi - lo;
-    if (span < 24) span = 24;               /* 纯噪声时也别让颜色乱跳 */
+    if (span < 24) span = 24;
 
-    /* 本帧: 幅度字节 -> 归一化强度 -> 颜色(整帧用同一映射, 画面才稳定) */
     uint16_t cmap[256];
     for (int i = 0; i < 256; i++) {
         int rel = (int)(((int64_t)i - lo) * 256 / span);
@@ -360,18 +386,15 @@ static void draw_page_fft(void)
         cmap[i] = wf_color((uint8_t)rel);
     }
 
-    /* ---- 第二遍: 逐行按颜色游程水平填充, 减少绘图调用 ----
-     * 最新一行贴屏幕底部, 历史向上滚动。 */
     for (uint32_t k = 0; k < n; k++) {
         const uint8_t *row = wf->rows[(oldest + k) % FT8_WF_ROWS];
-        int y = LCD_H - 1 - (int)(n - 1 - k);
-
+        int y = y0 + h - 1 - (int)(n - 1 - k);
         int x0 = 0;
         uint16_t cur = cmap[row[0]];
         for (int x = 1; x <= FT8_WF_COLS; x++) {
             uint16_t c = (x < FT8_WF_COLS) ? cmap[row[x]] : (uint16_t)(cur ^ 0x100);
             if (c != cur) {
-                if (cur != BLACK && x > x0)          /* 底色由 LCD_Clear 负责, 黑段可跳过 */
+                if (cur != BLACK && x > x0)
                     LCD_Fill((uint16_t)x0, (uint16_t)y, (uint16_t)x, (uint16_t)(y + 1), cur);
                 x0 = x;
                 cur = c;
@@ -380,8 +403,514 @@ static void draw_page_fft(void)
     }
 }
 
+/* ================= 页 0 主操作页(仿 FT8CN, 小字): 状态 + 瀑布(含AF红线) + 发射设置 ================= */
+#define MAIN_WF_Y   12
+#define MAIN_WF_H   76                  /* y12..87 */
+#define MAIN_SCALE_Y (MAIN_WF_Y + MAIN_WF_H)   /* 88 */
+#define MAIN_ITEM_Y  (MAIN_SCALE_Y + 12)       /* 100, 4 项 * 12px = 48 -> 148 */
+
+#define MAIN_ITEM_N 4
+static int s_main_sel = 0;              /* 0=TX开关 1=步数 2=时隙 3=音频频率 */
+
+static void main_adjust(int dir)
+{
+    switch (s_main_sel) {
+    case 0:
+        cfg.tx_enable = !cfg.tx_enable;
+        break;
+    case 1: {
+        int v = (int)cfg.tx.type + dir;
+        if (v < 0) v = 6;
+        if (v > 6) v = 0;
+        cfg.tx.type = (ft8_app_msg_type_t)v;
+        break;
+    }
+    case 2:
+        cfg.tx_slot_parity = (cfg.tx_slot_parity & 1) ? 0 : 1;
+        break;
+    case 3: {
+        float f = cfg.audio_freq_hz + dir * 50.0f;
+        if (f < 100.0f)  f = 100.0f;
+        if (f > 3000.0f) f = 3000.0f;
+        cfg.audio_freq_hz = f;
+        break;
+    }
+    default: break;
+    }
+}
+
+static void draw_page_main(void)
+{
+    bool tx = ft8_app_tx_busy();
+
+    /* 状态栏(小字): 频率 MHz + UTC; 右侧 TX(红)/RX(绿) */
+    if (cfg.qso_freq_mhz > 0.0f)
+        lcd_line(0, WHITE, 12, "%.3f %02u%02u%02u", (double)cfg.qso_freq_mhz,
+                 cfg.gps.valid ? cfg.gps.hour : 0,
+                 cfg.gps.valid ? cfg.gps.minute : 0,
+                 cfg.gps.valid ? cfg.gps.second : 0);
+    else
+        lcd_line(0, WHITE, 12, "%s %02u%02u%02u", cfg.band[0] ? cfg.band : "---",
+                 cfg.gps.valid ? cfg.gps.hour : 0,
+                 cfg.gps.valid ? cfg.gps.minute : 0,
+                 cfg.gps.valid ? cfg.gps.second : 0);
+    LCD_ShowString((uint16_t)(LCD_W - 12), 0, (const uint8_t *)(tx ? "TX" : "RX"),
+                   tx ? RED : GREEN, BLACK, 12, 0);
+
+    /* 瀑布 + 音频频率红线定位 */
+    draw_waterfall(MAIN_WF_Y, MAIN_WF_H);
+    if (cfg.rx_f_max > cfg.rx_f_min) {
+        int x = (int)((cfg.audio_freq_hz - cfg.rx_f_min) * (LCD_W - 1) /
+                      (cfg.rx_f_max - cfg.rx_f_min));
+        if (x < 0) x = 0;
+        if (x > LCD_W - 1) x = LCD_W - 1;
+        LCD_Fill((uint16_t)x, MAIN_WF_Y, (uint16_t)(x + 1),
+                 (uint16_t)(MAIN_WF_Y + MAIN_WF_H), RED);
+    }
+
+    /* 频率刻度 */
+    lcd_line(MAIN_SCALE_Y, GRAY, 12, "%.3gk-%.3gk",
+             (double)cfg.rx_f_min / 1000.0, (double)cfg.rx_f_max / 1000.0);
+
+    /* 设置项(小字, 选中反色) */
+    int typ = (int)cfg.tx.type;
+    if (typ < 0 || typ > 6) typ = 0;
+    for (int i = 0; i < MAIN_ITEM_N; i++) {
+        int y = MAIN_ITEM_Y + i * 12;
+        bool sel = (i == s_main_sel);
+        switch (i) {
+        case 0:
+            if (sel) lcd_line_bg(y, 12, BLACK, YELLOW, "TX  %s", cfg.tx_enable ? "ON" : "OFF");
+            else     lcd_line(y, cfg.tx_enable ? GREEN : GRAY, 12, "TX  %s", cfg.tx_enable ? "ON" : "OFF");
+            break;
+        case 1:
+            if (sel) lcd_line_bg(y, 12, BLACK, YELLOW, "STEP %s", s_msg_opts[typ]);
+            else     lcd_line(y, WHITE, 12, "STEP %s", s_msg_opts[typ]);
+            break;
+        case 2:
+            if (sel) lcd_line_bg(y, 12, BLACK, YELLOW, "SLOT %s", (cfg.tx_slot_parity & 1) ? "odd" : "even");
+            else     lcd_line(y, WHITE, 12, "SLOT %s", (cfg.tx_slot_parity & 1) ? "odd" : "even");
+            break;
+        case 3:
+            if (sel) lcd_line_bg(y, 12, BLACK, YELLOW, "AF   %.0fHz", cfg.audio_freq_hz);
+            else     lcd_line(y, WHITE, 12, "AF   %.0fHz", cfg.audio_freq_hz);
+            break;
+        default: break;
+        }
+    }
+
+    /* 当前步数对应的发射内容预览 */
+    {
+        int y = MAIN_ITEM_Y + MAIN_ITEM_N * 12;   /* 148 */
+        const char *to = cfg.tx.call_to[0] ? cfg.tx.call_to : "-";
+        switch (typ) {
+        case FT8_APP_MSG_CQ:
+            if (cfg.tx.cq_modifier[0])
+                lcd_line(y, CYAN, 12, "CQ %s %s %s", cfg.tx.cq_modifier, cfg.callsign, cfg.grid);
+            else
+                lcd_line(y, CYAN, 12, "CQ %s %s", cfg.callsign, cfg.grid);
+            break;
+        case FT8_APP_MSG_CALL:
+            lcd_line(y, CYAN, 12, "%s %s %s", to, cfg.callsign, cfg.grid);
+            break;
+        case FT8_APP_MSG_REPORT:
+            lcd_line(y, CYAN, 12, "%s %s %+d", to, cfg.callsign, cfg.tx.rst_db);
+            break;
+        case FT8_APP_MSG_R_REPORT:
+            lcd_line(y, CYAN, 12, "%s %s R%+d", to, cfg.callsign, cfg.tx.rst_db);
+            break;
+        case FT8_APP_MSG_RRR:
+            lcd_line(y, CYAN, 12, "%s %s RRR", to, cfg.callsign);
+            break;
+        case FT8_APP_MSG_RR73:
+            lcd_line(y, CYAN, 12, "%s %s RR73", to, cfg.callsign);
+            break;
+        case FT8_APP_MSG_73:
+            lcd_line(y, CYAN, 12, "%s %s 73", to, cfg.callsign);
+            break;
+        default: break;
+        }
+    }
+}
+
+/* ================= 页 1 解码列表(小字, 呼号一行 + 其他一行, 新信息在底部) ================= */
+static int s_rx_sel = 0;        /* 选中项(时间序: 0=最旧, cnt-1=最新) */
+static int s_rx_last_cnt = 0;
+#define DEC_ROWS 6              /* 一屏 6 条(每条 2 行小字, 24px) */
+
+/* CQ=黄, 呼我=绿, 收尾=青, 其它=白 */
+static uint16_t rx_msg_color(const char *text)
+{
+    if (strncmp(text, "CQ", 2) == 0) return YELLOW;
+    if (strstr(text, "RR73") || strstr(text, "RRR") || strstr(text, " 73")) return CYAN;
+    if (cfg.callsign[0] && strncmp(text, cfg.callsign, strlen(cfg.callsign)) == 0) return GREEN;
+    return WHITE;
+}
+
+static int decode_count(void)
+{
+    const ft8_rx_log_t *log = ft8_rx_log();
+    if (log == NULL || log->seq == 0) return 0;
+    return (log->seq < FT8_RX_MSG_MAX) ? (int)log->seq : FT8_RX_MSG_MAX;
+}
+
+/* 时间序第 k 项(0=最旧) -> 环形下标 */
+static const ft8_rx_msg_t *decode_at(int k, int cnt)
+{
+    const ft8_rx_log_t *log = ft8_rx_log();
+    if (log == NULL || k < 0 || k >= cnt) return NULL;
+    uint32_t idx = (log->put - (uint32_t)cnt + (uint32_t)k + FT8_RX_MSG_MAX * 2) % FT8_RX_MSG_MAX;
+    return &log->msgs[idx];
+}
+
+static void draw_page_decode(void)
+{
+    bool tx = ft8_app_tx_busy();
+    lcd_row(0, CYAN, "DECODE");
+    LCD_ShowString((uint16_t)(LCD_W - 16), 0, (const uint8_t *)(tx ? "TX" : "RX"),
+                   tx ? RED : GREEN, BLACK, 16, 0);
+
+    int cnt = decode_count();
+
+    /* 新消息到达且原先停在最新 -> 跟随到最新 */
+    if (cnt != s_rx_last_cnt) {
+        if (s_rx_sel >= s_rx_last_cnt - 1) s_rx_sel = cnt - 1;
+        s_rx_last_cnt = cnt;
+    }
+    if (s_rx_sel > cnt - 1) s_rx_sel = cnt - 1;
+    if (s_rx_sel < 0) s_rx_sel = 0;
+
+    /* 选中项居中滚动 */
+    int top = s_rx_sel - (DEC_ROWS / 2);
+    if (top < 0) top = 0;
+    if (top > cnt - DEC_ROWS) top = cnt - DEC_ROWS;
+    if (top < 0) top = 0;
+
+    for (int r = 0; r < DEC_ROWS; r++) {
+        int k = top + r;
+        int y = 16 + r * 24;                 /* 每条 24px: 文本 12 + DT/SNR 12 */
+        const ft8_rx_msg_t *m = decode_at(k, cnt);
+        if (m == NULL) {
+            lcd_line(y, BLACK, 12, "");
+            lcd_line(y + 12, BLACK, 12, "");
+            continue;
+        }
+        uint16_t col = rx_msg_color(m->text);
+        bool sel = (k == s_rx_sel);
+
+        /* 第 1 行: 解码文本 */
+        if (sel) lcd_line_bg(y, 12, BLACK, YELLOW, "%s", m->text);
+        else     lcd_line(y, col, 12, "%s", m->text);
+
+        /* 第 2 行: DT(时间差)  SNR(信号) */
+        if (isfinite(m->snr_db)) {
+            if (sel) lcd_line_bg(y + 12, 12, BLACK, YELLOW, "%+4.1f %+3.0f", m->dt_s, m->snr_db);
+            else     lcd_line(y + 12, GRAY, 12, "%+4.1f %+3.0f", m->dt_s, m->snr_db);
+        } else {
+            if (sel) lcd_line_bg(y + 12, 12, BLACK, YELLOW, "%+4.1f  --", m->dt_s);
+            else     lcd_line(y + 12, GRAY, 12, "%+4.1f  --", m->dt_s);
+        }
+    }
+}
+
+/* ================= 页 2 GPS 概览(信息+卫星+信号合并) ================= */
+static void draw_page_gps(const gps_info_t *g)
+{
+    lcd_row(0, CYAN, "GPS %s", g->fix_valid ? "FIX" : "NOFIX");
+
+    if (g->time_valid)
+        lcd_row(1, WHITE, "%04u-%02u-%02u %02u:%02u:%02u",
+                g->year, g->month, g->day, g->hour, g->minute, g->second);
+    else
+        lcd_row(1, GRAY, "date --");
+
+    if (g->fix_valid) {
+        lcd_row(2, GREEN, "N %0.5f", g->latitude);
+        lcd_row(3, GREEN, "E %0.5f", g->longitude);
+    } else {
+        lcd_row(2, GRAY, "N -----");
+        lcd_row(3, GRAY, "E -----");
+    }
+
+    lcd_row(4, WHITE, "SVs%2u HDOP%.1f", g->satellites, g->hdop);
+    lcd_row(5, WHITE, "PDOP%.1f VDOP%.1f", g->pdop, g->vdop);
+    lcd_row(6, WHITE, "ALT%0.0fm %0.1fkm/h", g->altitude_m, g->speed_kmh);
+    lcd_row(7, WHITE, "CRS%0.0f Q%d T%d M%c", g->course_deg, g->fix_quality, g->fix_type,
+            g->mode_ind ? g->mode_ind : '-');
+
+    if (g->antenna == GPS_ANT_OK)         lcd_row(8, GREEN, "ANT OK");
+    else if (g->antenna == GPS_ANT_OPEN)  lcd_row(8, RED, "ANT OPEN!");
+    else if (g->antenna == GPS_ANT_SHORT) lcd_row(8, RED, "ANT SHORT!");
+    else                                  lcd_row(8, GRAY, "ANT --");
+
+    lcd_row(9, WHITE, "PPS#%lu", (unsigned long)g->pps_seq);
+}
+
+/* ================= 页 3 日志(呼号/网格/信号/频率, 每条 2 行; 中键看原文详情) ================= */
+static int s_log_sel = 9999;       /* 选中记录(0=最旧), 初始贴最新 */
+static int s_log_top = 9999;       /* 列表顶部记录 */
+static int s_log_hscroll = 0;
+static int s_log_tick = 0;
+static int s_log_detail = 0;
+
+#define LOG_VIS_ROWS 6                 /* 一屏 6 条(每条 2 行小字) */
+
+static void draw_page_log(void)
+{
+    /* 约每 1s 重新读取一次文件尾部(读失败保留旧内容) */
+    if ((s_log_tick++ % 50) == 0) qso_log_tail(0);   /* 0 = 读取全部记录 */
+
+    int n = qso_log_tail_count();
+
+    if (s_log_detail) {                 /* 详情: 显示原始 ADIF 行, 可横向滚动 */
+        lcd_row(0, CYAN, "DETAIL %d/%d", s_log_sel + 1, n);
+        const char *raw = qso_log_tail_line(s_log_sel);
+        if (raw) {
+            int len = (int)strlen(raw);
+            int off = s_log_hscroll;
+            if (off > len) off = len;
+            lcd_row(1, WHITE, "%s", raw + off);
+        }
+        lcd_row(9, GRAY, "MID: back");
+        return;
+    }
+
+    lcd_row(0, CYAN, "LOG %d", n);
+    if (n == 0) { lcd_row(4, GRAY, "empty / usb busy"); return; }
+
+    if (s_log_sel > n - 1) s_log_sel = n - 1;
+    if (s_log_sel < 0) s_log_sel = 0;
+    if (s_log_top > n - 1) s_log_top = n - 1;
+    if (s_log_top < 0) s_log_top = 0;
+    if (s_log_sel < s_log_top) s_log_top = s_log_sel;
+    if (s_log_sel > s_log_top + (LOG_VIS_ROWS - 1)) s_log_top = s_log_sel - (LOG_VIS_ROWS - 1);
+
+    for (int i = 0; i < LOG_VIS_ROWS; i++) {
+        int k = s_log_top + i;
+        int y = 16 + i * 24;                 /* 每条 24px: 两行 12px 小字 */
+        const qso_log_sum_t *s = (k < n) ? qso_log_tail_summary(k) : NULL;
+        if (s == NULL) { LCD_Fill(0, (uint16_t)y, LCD_W, (uint16_t)(y + 24), BLACK); continue; }
+        uint16_t col = (k == s_log_sel) ? YELLOW : WHITE;
+        lcd_line(y,      col, 12, "%s", s->call);                     /* 呼号 */
+        lcd_line(y + 12, col, 12, "%s %s %s", s->grid, s->rst, s->freq); /* 网格 信号 频率 */
+    }
+}
+
+/* ================= 页 7: 配置设置(可编辑 cfg 所有主要项) ================= */
+typedef enum { CI_BOOL, CI_INT, CI_U32, CI_FLOAT, CI_STR, CI_ENUM } ci_type_t;
+
+typedef struct {
+    const char *name;
+    ci_type_t   type;
+    void       *ptr;
+    float       vmin, vmax, step;
+    int         len;                 /* 字符串缓冲长度 */
+    const char *const *opts;         /* 枚举选项名 */
+    int         nopts;
+    int         dec;                 /* 浮点显示小数位 */
+} ci_item_t;
+
+static const char *const s_proto_opts[] = { "FT8", "FT4" };
+
+static const ci_item_t s_ci[] = {
+    { "callsign", CI_STR,   cfg.callsign,              0,0,0, sizeof(cfg.callsign), NULL, 0, 0 },
+    { "grid",     CI_STR,   cfg.grid,                  0,0,0, sizeof(cfg.grid),     NULL, 0, 0 },
+    { "band",     CI_STR,   cfg.band,                  0,0,0, sizeof(cfg.band),     NULL, 0, 0 },
+    { "freq_MHz", CI_FLOAT, &cfg.qso_freq_mhz,       0.1f, 60.0f, 0.001f, 0, NULL, 0, 6 },
+    { "protocol", CI_ENUM,  &cfg.protocol,             0,0,0, 0, s_proto_opts, 2, 0 },
+    { "tx_en",    CI_BOOL,  &cfg.tx_enable,            0,0,0, 0, NULL, 0, 0 },
+    { "rx_en",    CI_BOOL,  &cfg.rx_enable,            0,0,0, 0, NULL, 0, 0 },
+    { "usb_msc",  CI_BOOL,  &cfg.usb_mount_enable,     0,0,0, 0, NULL, 0, 0 },
+    { "utc_en",   CI_BOOL,  &cfg.utc_enable,           0,0,0, 0, NULL, 0, 0 },
+    { "gps_utc",  CI_BOOL,  &cfg.gps_utc_enable,       0,0,0, 0, NULL, 0, 0 },
+    { "gps_pps",  CI_BOOL,  &cfg.gps_use_pps,          0,0,0, 0, NULL, 0, 0 },
+    { "slot_par", CI_INT,   &cfg.tx_slot_parity,       0, 1, 1, 0, NULL, 0, 0 },
+    { "delay_ms", CI_U32,   &cfg.tx_delay_ms,          0, 10000, 50, 0, NULL, 0, 0 },
+    { "msg_type", CI_ENUM,  &cfg.tx.type,              0,0,0, 0, s_msg_opts, 7, 0 },
+    { "call_to",  CI_STR,   cfg.tx.call_to,            0,0,0, sizeof(cfg.tx.call_to), NULL, 0, 0 },
+    { "cq_mod",   CI_STR,   cfg.tx.cq_modifier,        0,0,0, sizeof(cfg.tx.cq_modifier), NULL, 0, 0 },
+    { "rst_db",   CI_INT,   &cfg.tx.rst_db,          -30, 30, 1, 0, NULL, 0, 0 },
+    { "af_Hz",    CI_FLOAT, &cfg.audio_freq_hz,      100, 3000, 10, 0, NULL, 0, 0 },
+    { "af_lvl",   CI_FLOAT, &cfg.audio_level,          0, 1, 0.05f, 0, NULL, 0, 2 },
+    { "rx_fmin",  CI_FLOAT, &cfg.rx_f_min,             0, 3000, 50, 0, NULL, 0, 0 },
+    { "rx_fmax",  CI_FLOAT, &cfg.rx_f_max,           100, 5000, 50, 0, NULL, 0, 0 },
+    { "cand",     CI_INT,   &cfg.max_candidates,      10, 140, 5, 0, NULL, 0, 0 },
+    { "ldpc_it",  CI_INT,   &cfg.ldpc_iterations,      5, 100, 5, 0, NULL, 0, 0 },
+    { "parse_ms", CI_U32,   &cfg.rx_parse_ms,       1500, 5000, 100, 0, NULL, 0, 0 },
+    { "qso_en",   CI_BOOL,  &cfg.qso.enable,           0,0,0, 0, NULL, 0, 0 },
+    { "qso_cq",   CI_BOOL,  &cfg.qso.cq_mode,          0,0,0, 0, NULL, 0, 0 },
+    { "qso_rty",  CI_INT,   &cfg.qso.max_retries,      1, 20, 1, 0, NULL, 0, 0 },
+    { "qso_to",   CI_STR,   cfg.qso.target_callsign,   0,0,0, sizeof(cfg.qso.target_callsign), NULL, 0, 0 },
+};
+#define CI_N ((int)(sizeof(s_ci) / sizeof(s_ci[0])))
+
+static int s_ci_sel = 0;
+static int s_ci_scroll = 0;
+static int s_ci_cursor = 0;
+static const char s_ci_charset[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/.-";
+
+/* 把配置项当前值格式化成字符串(与显示一致), 返回长度 */
+static int ci_value_str(const ci_item_t *it, char *out, size_t cap)
+{
+    out[0] = '\0';
+    switch (it->type) {
+    case CI_BOOL:  snprintf(out, cap, "%s", *(bool *)it->ptr ? "Y" : "N"); break;
+    case CI_INT:   snprintf(out, cap, "%d", *(int *)it->ptr); break;
+    case CI_U32:   snprintf(out, cap, "%lu", (unsigned long)*(uint32_t *)it->ptr); break;
+    case CI_FLOAT: snprintf(out, cap, "%.*f", it->dec, (double)*(float *)it->ptr); break;
+    case CI_STR:   snprintf(out, cap, "%s", (char *)it->ptr); break;
+    case CI_ENUM: {
+        int v = *(int *)it->ptr;
+        if (v < 0 || v >= it->nopts) v = 0;
+        snprintf(out, cap, "%s", it->opts[v]);
+        break;
+    }
+    default: break;
+    }
+    return (int)strlen(out);
+}
+
+/* 按 dir 修改"当前光标所在的那一位": 数值改该位数字(不进位), 字符串换字符, 枚举/布尔整体切换 */
+static void ci_edit_char(const ci_item_t *it, int dir)
+{
+    if (it->type == CI_BOOL) { *(bool *)it->ptr = !*(bool *)it->ptr; return; }
+    if (it->type == CI_ENUM) {
+        int v = *(int *)it->ptr + dir;
+        if (v < 0) v = it->nopts - 1;
+        if (v >= it->nopts) v = 0;
+        *(int *)it->ptr = v;
+        return;
+    }
+
+    char v[24];
+    int len = ci_value_str(it, v, sizeof(v));
+    if (len <= 0) return;
+    int pos = s_ci_cursor;
+    if (pos < 0) pos = 0;
+    if (pos >= len) pos = len - 1;
+    char c = v[pos];
+
+    if (it->type == CI_STR) {
+        const char *p = strchr(s_ci_charset, c);
+        int idx = p ? (int)(p - s_ci_charset) : 0;
+        int setn = (int)strlen(s_ci_charset);
+        idx = (idx + dir + setn) % setn;
+        char *s = (char *)it->ptr;
+        s[pos] = s_ci_charset[idx];
+        if (s[pos] && pos + 1 < it->len && s[pos + 1] == '\0') s[pos + 1] = '\0';
+        return;
+    }
+
+    /* 数值: 只改该位字符, 再解析回字段 */
+    if (c >= '0' && c <= '9') {
+        int d = c - '0';
+        d = (d + dir + 10) % 10;
+        v[pos] = (char)('0' + d);
+    } else if ((c == '-' || c == '+') && pos == 0) {
+        v[0] = (c == '-') ? '+' : '-';
+    } else {
+        return;
+    }
+
+    if (it->type == CI_INT) {
+        long x = strtol(v, NULL, 10);
+        if (x < (long)it->vmin) x = (long)it->vmin;
+        if (x > (long)it->vmax) x = (long)it->vmax;
+        *(int *)it->ptr = (int)x;
+    } else if (it->type == CI_U32) {
+        long x = strtol(v, NULL, 10);
+        if (x < (long)it->vmin) x = (long)it->vmin;
+        if (x > (long)it->vmax) x = (long)it->vmax;
+        *(uint32_t *)it->ptr = (uint32_t)x;
+    } else if (it->type == CI_FLOAT) {
+        double x = strtod(v, NULL);
+        if (x < (double)it->vmin) x = it->vmin;
+        if (x > (double)it->vmax) x = it->vmax;
+        *(float *)it->ptr = (float)x;
+    }
+}
+
+static void ci_key(key_id_t k)
+{
+    const ci_item_t *it = &s_ci[s_ci_sel];
+    switch (k) {
+    case KEY_ID_UP:    if (s_ci_sel > 0) s_ci_sel--; break;
+    case KEY_ID_DOWN:  if (s_ci_sel < CI_N - 1) s_ci_sel++; break;
+    case KEY_ID_LEFT:  ci_edit_char(it, -1); break;
+    case KEY_ID_RIGHT: ci_edit_char(it, +1); break;
+    case KEY_ID_MID: {
+        /* 光标右移到下一位(字符串/数值按值长度, 枚举/布尔固定 1 位) */
+        int vlen = 1;
+        if (it->type == CI_STR || it->type == CI_INT ||
+            it->type == CI_U32 || it->type == CI_FLOAT) {
+            char v[24];
+            vlen = ci_value_str(it, v, sizeof(v));
+            if (vlen < 1) vlen = 1;
+        }
+        s_ci_cursor = (s_ci_cursor + 1) % vlen;
+        break;
+    }
+    default: break;
+    }
+    if (s_ci_sel < s_ci_scroll) s_ci_scroll = s_ci_sel;
+    if (s_ci_sel >= s_ci_scroll + 9) s_ci_scroll = s_ci_sel - 8;
+}
+
+static void draw_page_cfg_set(void)
+{
+    lcd_row(0, CYAN, "CFG SET %d/%d", s_ci_sel + 1, CI_N);
+
+    for (int r = 0; r < 9; r++) {
+        int i = s_ci_scroll + r;
+        if (i >= CI_N) break;
+        const ci_item_t *it = &s_ci[i];
+
+        if (i != s_ci_sel) {
+            switch (it->type) {
+            case CI_BOOL:  lcd_row(1 + r, WHITE, " %s %s", it->name, *(bool *)it->ptr ? "Y" : "N"); break;
+            case CI_INT:   lcd_row(1 + r, WHITE, " %s %d", it->name, *(int *)it->ptr); break;
+            case CI_U32:   lcd_row(1 + r, WHITE, " %s %lu", it->name, (unsigned long)*(uint32_t *)it->ptr); break;
+            case CI_FLOAT: lcd_row(1 + r, WHITE, " %s %.*f", it->name, it->dec, (double)*(float *)it->ptr); break;
+            case CI_STR:   lcd_row(1 + r, WHITE, " %s %s", it->name, (char *)it->ptr); break;
+            case CI_ENUM: {
+                int v = *(int *)it->ptr;
+                if (v < 0 || v >= it->nopts) v = 0;
+                lcd_row(1 + r, WHITE, " %s %s", it->name, it->opts[v]);
+                break;
+            }
+            default: break;
+            }
+            continue;
+        }
+
+        /* 选中行: 手工绘制, 并把光标所在位用反色(黑字黄底)高亮 */
+        char val[24];
+        int vlen = ci_value_str(it, val, sizeof(val));
+        int pos = s_ci_cursor;
+        if (pos < 0) pos = 0;
+        if (vlen > 0 && pos >= vlen) pos = vlen - 1;
+        if (vlen == 0) pos = 0;
+
+        char head[16];
+        int hl = 0;
+        head[hl++] = '>';
+        for (const char *s = it->name; *s && hl < 13; ) head[hl++] = *s++;
+        head[hl++] = ' ';
+        head[hl] = '\0';
+
+        int y = 16 * (1 + r);
+        LCD_Fill(0, (uint16_t)y, LCD_W, (uint16_t)(y + 16), BLACK);
+        LCD_ShowString(0, (uint16_t)y, (const uint8_t *)head, YELLOW, BLACK, 16, 0);
+        LCD_ShowString((uint16_t)(hl * 8), (uint16_t)y, (const uint8_t *)val, YELLOW, BLACK, 16, 0);
+
+        int cx = hl + pos;
+        if (vlen > 0 && cx < 16)
+            LCD_ShowChar((uint16_t)(cx * 8), (uint16_t)y, (uint8_t)val[pos], BLACK, YELLOW, 16, 0);
+    }
+}
+
 /* ================= LCD 主任务 ================= */
-#define LCD_PAGE_NUM    4                  /* 页数: 0=信息 1=卫星 2=信号 3=瀑布 */
+#define LCD_PAGE_NUM    5                  /* 页数: 0主页 1解码 2GPS 3日志 4配置 */
 static volatile int s_lcd_page = 0;        /* 当前显示页, 由按键回调修改 */
 
 static void LCD_task(void *arg)
@@ -403,10 +932,11 @@ static void LCD_task(void *arg)
         int page = s_lcd_page;              /* 手动按键翻页, 不再自动轮换 */
 
         LCD_Clear(BLACK);
-        if (page == 0)      draw_page_info(&g);
-        else if (page == 1) draw_page_sat(&g);
-        else if (page == 2) draw_page_signal(g);
-        else if (page == 3) draw_page_fft();
+        if (page == 0)      draw_page_main();       //FT8CN 风格主页(状态+瀑布+发射)
+        else if (page == 1) draw_page_decode();     //解码列表(文本优先, 配色)
+        else if (page == 2) draw_page_gps(&g);      //GPS 概览(信息+卫星+信号合并)
+        else if (page == 3) draw_page_log();        //日志(呼号/网格/信号/频率)
+        else if (page == 4) draw_page_cfg_set();    //配置设置, 可设置 cfg 所有内容
 
         LCD_Flush();                       /* 画完一整帧后一次性推送 */
 
@@ -482,34 +1012,79 @@ static void gps_time_task(void *arg)
 
 static void my_key_callback(key_id_t key_id, key_event_t event, void *user_data)
 {
-    /* 单击: 上/下/左/右 翻页, 中间键回首页 */
-    if (event == KEY_EVENT_CLICK)
-    {
-        ESP_LOGI("APP", "按键 %d 单击", key_id);
-        switch (key_id)
-        {
-        case KEY_ID_UP:
-        case KEY_ID_LEFT:
-            s_lcd_page = (s_lcd_page + LCD_PAGE_NUM - 1) % LCD_PAGE_NUM;
-            ESP_LOGI("APP", "按键翻页 -> %d", s_lcd_page);
-            break;
-        case KEY_ID_DOWN:
-        case KEY_ID_RIGHT:
-            s_lcd_page = (s_lcd_page + 1) % LCD_PAGE_NUM;
-            ESP_LOGI("APP", "按键翻页 -> %d", s_lcd_page);
-            break;
-        case KEY_ID_MID:
-            s_lcd_page = 0;
-            ESP_LOGI("APP", "按键返回首页");
-            break;
-        default:
-            break;
+    if (event == KEY_EVENT_LONG_PRESS) {
+        /* 方向键长按 = 连续变化(驱动每 ~120ms 重发); SET/RST/MID 长按不处理 */
+        if (key_id == KEY_ID_SET || key_id == KEY_ID_RST || key_id == KEY_ID_MID) return;
+    } else if (event != KEY_EVENT_CLICK) {
+        return;
+    }
+
+    int page = s_lcd_page;
+
+    /* SET=上一页, RST=下一页 */
+    if (key_id == KEY_ID_SET) {
+        s_lcd_page = (page + LCD_PAGE_NUM - 1) % LCD_PAGE_NUM;
+        ESP_LOGI("APP", "SET 上一页 -> %d", s_lcd_page);
+        return;
+    }
+    if (key_id == KEY_ID_RST) {
+        s_lcd_page = (page + 1) % LCD_PAGE_NUM;
+        ESP_LOGI("APP", "RST 下一页 -> %d", s_lcd_page);
+        return;
+    }
+
+    if (page == 0) {                       /* 主页: 上下选设置项, 左右调整(长按连续) */
+        if (key_id == KEY_ID_UP)        { if (s_main_sel > 0) s_main_sel--; }
+        else if (key_id == KEY_ID_DOWN) { if (s_main_sel < MAIN_ITEM_N - 1) s_main_sel++; }
+        else if (key_id == KEY_ID_LEFT)  main_adjust(-1);
+        else if (key_id == KEY_ID_RIGHT) main_adjust(+1);
+        return;
+    }
+
+    if (page == 1) {                       /* 解码页: 上下选, 左键设目标, 长按右键清空 */
+        int cnt = decode_count();
+        if (key_id == KEY_ID_UP)        { if (s_rx_sel > 0) s_rx_sel--; }        /* 上=更旧 */
+        else if (key_id == KEY_ID_DOWN) { if (s_rx_sel < cnt - 1) s_rx_sel++; }  /* 下=更新 */
+        else if (key_id == KEY_ID_LEFT) {
+            const ft8_rx_msg_t *m = decode_at(s_rx_sel, cnt);
+            if (m && m->call_de[0]) {
+                strncpy(cfg.tx.call_to, m->call_de, sizeof(cfg.tx.call_to) - 1);
+                cfg.tx.call_to[sizeof(cfg.tx.call_to) - 1] = '\0';
+                strncpy(cfg.qso.target_callsign, m->call_de, sizeof(cfg.qso.target_callsign) - 1);
+                cfg.qso.target_callsign[sizeof(cfg.qso.target_callsign) - 1] = '\0';
+                cfg.tx.type = FT8_APP_MSG_CALL;
+                ESP_LOGI("APP", "目标呼号设为 %s", m->call_de);
+            }
         }
+        else if (key_id == KEY_ID_RIGHT && event == KEY_EVENT_LONG_PRESS) {
+            ft8_rx_log_clear();            /* 长按右键清空列表 */
+            s_rx_sel = 0;
+            s_rx_last_cnt = 0;
+            ESP_LOGI("APP", "清空解码列表");
+        }
+        return;
     }
-    else if (event == KEY_EVENT_LONG_PRESS)
-    {
-        ESP_LOGI("APP", "按键 %d 长按 ", key_id);
+
+    if (page == 3) {                       /* 日志页: 上下选行, 中键详情, 左右横滚 */
+        if (s_log_detail) {
+            if (key_id == KEY_ID_MID)        s_log_detail = 0;
+            else if (key_id == KEY_ID_LEFT)  { if (s_log_hscroll > 0) s_log_hscroll--; }
+            else if (key_id == KEY_ID_RIGHT) s_log_hscroll++;
+            return;
+        }
+        if (key_id == KEY_ID_UP)         { if (s_log_sel > 0) s_log_sel--; }
+        else if (key_id == KEY_ID_DOWN)  s_log_sel++;
+        else if (key_id == KEY_ID_MID)   { s_log_detail = 1; s_log_hscroll = 0; }
+        return;
     }
+
+    if (page == 4) {                       /* 配置页 */
+        ci_key(key_id);
+        return;
+    }
+
+    /* 其它页(主页/GPS): 方向键不用于翻页; 中键回主页。翻页只用 SET/RST。 */
+    if (key_id == KEY_ID_MID) s_lcd_page = 0;
 }
 
 void app_main(void)
@@ -531,6 +1106,8 @@ void app_main(void)
     cfg.rx_parse_ms         = 100;                          /* 每个时隙结束前静默期(ms)，用于整窗解析 */    
     snprintf(cfg.callsign, sizeof(cfg.callsign), "BG7ZJW"); // 本机呼号
     snprintf(cfg.grid,     sizeof(cfg.grid),     "JO70");   // 本机网格
+    snprintf(cfg.band,     sizeof(cfg.band),     "40m");    // QSO 日志用频段(设备无射频信息, 手动指定)
+    cfg.qso_freq_mhz        = 7.074000f;                    // QSO 日志用频率 MHz
     cfg.tx.type             = FT8_APP_MSG_CQ;               /* 第几类消息: CQ / CALL / REPORT / R_REPORT / RRR / RR73 / 73 */
     cfg.tx.cq_modifier[0]   = '\0';                         /* "DX"/"WW"/"TEST"... 仅 CQ 类用 */
     cfg.tx.call_to[0]       = '\0';                         /* 目标呼号(类型 2~6 用)，如 "BG5ABC" */
@@ -554,10 +1131,17 @@ void app_main(void)
     cfg.qso.max_retries      = 4;          // 超过此次数仍无进展则放弃该台
     cfg.qso.target_callsign[0] = '\0';     // 应答模式: 只应答此呼号, 空则应答所有陌生 CQ 台
 
+    cfg.usb_mount_enable    = false;       // false=不启动 USB, 只本地写 /storage/log.txt    是否把日志分区作为 U 盘挂载(USB MSC 暴露给 PC);  只本地挂载 FAT 写日志, 不启动 USB 
+    
     //true 
     //false
 
     //启动任务============================================================================================
+    /* QSO 日志: 注册回调并初始化 FAT 分区 + USB 大容量存储(U盘) */
+    ft8_app_set_qso_callback(qso_log_on_qso, NULL);
+    if (qso_log_init(cfg.usb_mount_enable) != ESP_OK)
+        ESP_LOGW(TAG, "QSO 日志存储初始化失败(不影响收发)");
+
     /* 搬运 GPS UTC 时间/日期/PPS 进 cfg.gps(供 ft8_app UTC 对齐，先启动让它尽早喂数据) */
     xTaskCreatePinnedToCore(gps_time_task, "gps_utc", 4096, NULL, 5, NULL, 1);
 

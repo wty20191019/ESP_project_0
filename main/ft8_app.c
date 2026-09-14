@@ -1,4 +1,5 @@
 ﻿#include "ft8_app.h"
+#include "ft8_qso.h"
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
@@ -50,6 +51,16 @@ static const char *TAG = "ft8_app";
  * TX 任务下一个本台时隙前会自动重建波形，无需专用接口。 */
 static ft8_app_config_t *s_cfg_p = NULL;
 #define s_cfg (*s_cfg_p)
+
+/* QSO 完成回调(由日志模块注册) */
+static ft8_qso_callback_t s_qso_cb = NULL;
+static void *s_qso_cb_arg = NULL;
+
+void ft8_app_set_qso_callback(ft8_qso_callback_t cb, void *arg)
+{
+    s_qso_cb = cb;
+    s_qso_cb_arg = arg;
+}
 
 static bool s_utc_ok = false;
 
@@ -507,6 +518,46 @@ static float rx_measure_snr(const ftx_waterfall_t *wf, const ftx_candidate_t *ca
 }
 
 /* ============================================================
+ * 最近解码消息环形缓冲(供 LCD 的 RX 页显示, 无锁)
+ * ============================================================ */
+static ft8_rx_log_t s_rx_log;
+
+static void rxlog_add(const char *text, const char *call_to, const char *call_de,
+                      float freq_hz, float snr_db, float dt_s, int64_t slot)
+{
+    if (text == NULL) return;
+    ft8_rx_msg_t *m = &s_rx_log.msgs[s_rx_log.put];
+    strncpy(m->text, text, sizeof(m->text) - 1);
+    m->text[sizeof(m->text) - 1] = '\0';
+    m->call_to[0] = '\0';
+    m->call_de[0] = '\0';
+    if (call_to) { strncpy(m->call_to, call_to, sizeof(m->call_to) - 1); m->call_to[sizeof(m->call_to) - 1] = '\0'; }
+    if (call_de) { strncpy(m->call_de, call_de, sizeof(m->call_de) - 1); m->call_de[sizeof(m->call_de) - 1] = '\0'; }
+    m->freq_hz = freq_hz;
+    m->snr_db  = snr_db;
+    m->dt_s    = dt_s;
+    m->slot    = slot;
+    s_rx_log.put = (s_rx_log.put + 1) % FT8_RX_MSG_MAX;
+    s_rx_log.seq++;
+}
+
+const ft8_rx_log_t *ft8_rx_log(void)
+{
+    return &s_rx_log;
+}
+
+void ft8_rx_log_clear(void)
+{
+    s_rx_log.put = 0;
+    s_rx_log.seq = 0;
+}
+
+bool ft8_app_tx_busy(void)
+{
+    return s_tx_busy;
+}
+
+/* ============================================================
  * RX：整窗解析一个时隙(带解码耗时预算，避免拖入下一时隙采集)
  * ============================================================ */
 static void rx_decode_slot(monitor_t *mon, int64_t prev_slot, int64_t budget_us)
@@ -589,6 +640,21 @@ static void rx_decode_slot(monitor_t *mon, int64_t prev_slot, int64_t budget_us)
 
         /* 投递给自动 QSO 引擎(启用时才建队, 无队则此调用为空操作) */
         qso_rx_publish(&msg, f_hz, snr_db, prev_slot);
+
+        /* 存入最近解码环形(供 LCD RX 页) */
+        char mto[16] = {0}, mde[16] = {0};
+        {
+            ftx_message_type_t mt = ftx_message_get_type(&msg);
+            if (mt == FTX_MESSAGE_TYPE_STANDARD || mt == FTX_MESSAGE_TYPE_NONSTD_CALL) {
+                char ex[12];
+                ftx_field_t ft[FTX_MAX_MESSAGE_FIELDS];
+                if (mt == FTX_MESSAGE_TYPE_STANDARD)
+                    ftx_message_decode_std(&msg, &s_hash_if, mto, mde, ex, ft);
+                else
+                    ftx_message_decode_nonstd(&msg, &s_hash_if, mto, mde, ex, ft);
+            }
+        }
+        rxlog_add(text, mto, mde, f_hz, snr_db, t_s, prev_slot);
 
         s_stat_decoded++;
         ESP_LOGI(T, "[RX] %s @%0.0fHz t=%0.2fs SNR=%s: %s",
@@ -1021,6 +1087,19 @@ static void qso_time_str(char *buf, size_t n)
         snprintf(buf, n, "UTC--:--:--");
 }
 
+/* 记录本次 QSO 的起始 UTC 时间(供日志 time_on 用) */
+static void qso_mark_start(qso_ctx_t *c)
+{
+    ft8_app_gps_time_t g;
+    if (gps_cfg_get(&g) && g.valid) {
+        c->have_start = true;
+        c->year_on  = g.year;  c->month_on  = g.month;  c->day_on  = g.day;
+        c->hour_on  = g.hour;  c->minute_on = g.minute; c->second_on = g.second;
+    } else {
+        c->have_start = false;
+    }
+}
+
 /* ---------------- 解码消息发布(RX 任务调用) ---------------- */
 static void qso_rx_publish(const ftx_message_t *msg, float freq_hz, float snr_db, int64_t slot)
 {
@@ -1166,7 +1245,7 @@ static void qso_to_idle(qso_ctx_t *c)
     qso_apply(c);
 }
 
-/* 通联完成: 记日志、写"已完成"去重表、回空闲 */
+/* 通联完成: 记日志、回调日志模块、写"已完成"去重表、回空闲 */
 static void qso_complete(qso_ctx_t *c, int64_t now_slot)
 {
     char t[24], line[192];
@@ -1175,6 +1254,32 @@ static void qso_complete(qso_ctx_t *c, int64_t now_slot)
              t, c->peer, c->peer_grid[0] ? c->peer_grid : "-", c->my_rst, c->peer_rst,
              c->tx_parity);
     qso_log_raw(line);
+
+    /* 组装结构化记录交给日志模块(写 ADIF) */
+    if (s_qso_cb) {
+        ft8_qso_record_t rec;
+        memset(&rec, 0, sizeof(rec));
+        strncpy(rec.call, c->peer, sizeof(rec.call) - 1);
+        strncpy(rec.grid, c->peer_grid, sizeof(rec.grid) - 1);
+        strncpy(rec.station_callsign, s_cfg.callsign, sizeof(rec.station_callsign) - 1);
+        strncpy(rec.my_grid, s_cfg.grid, sizeof(rec.my_grid) - 1);
+        strncpy(rec.band, s_cfg.band, sizeof(rec.band) - 1);
+        rec.freq_mhz = s_cfg.qso_freq_mhz;
+        rec.rst_sent = c->my_rst ? c->my_rst : c->peer_rst;
+        rec.rst_rcvd = c->peer_rst;
+        if (c->have_start) {
+            ft8_app_gps_time_t g;
+            if (gps_cfg_get(&g) && g.valid) {
+                rec.have_time = true;
+                rec.year_on = c->year_on;  rec.month_on = c->month_on;  rec.day_on = c->day_on;
+                rec.hour_on = c->hour_on;  rec.minute_on = c->minute_on; rec.second_on = c->second_on;
+                rec.year_off = g.year; rec.month_off = g.month; rec.day_off = g.day;
+                rec.hour_off = g.hour; rec.minute_off = g.minute; rec.second_off = g.second;
+            }
+        }
+        s_qso_cb(&rec, s_qso_cb_arg);
+    }
+
     qso_note(c->peer, now_slot, true);
     qso_to_idle(c);
 }
@@ -1265,6 +1370,7 @@ static void qso_on_rx(qso_ctx_t *c, const qso_rx_t *m)
             c->tx_parity  = ev.parity ^ 1;              /* 对方反相时隙发射 */
             c->attempts   = 0;
             c->last_counted = -1;
+            qso_mark_start(c);
             qso_apply(c);
             snprintf(line, sizeof(line), "[%s] -> 呼叫 %s %s(改发相位%d)",
                      t, c->peer, c->peer_grid, c->tx_parity);
@@ -1284,6 +1390,7 @@ static void qso_on_rx(qso_ctx_t *c, const qso_rx_t *m)
             c->tx_parity  = s_cfg.tx_slot_parity & 1;
             c->attempts   = 0;
             c->last_counted = -1;
+            qso_mark_start(c);
             qso_apply(c);
             snprintf(line, sizeof(line), "[%s] %s 回答我的 CQ, 发报告 %+ddB",
                      t, c->peer, c->my_rst);
@@ -1404,12 +1511,15 @@ void ft8_app_config_default(ft8_app_config_t *cfg)
     cfg->protocol        = FTX_PROTOCOL_FT8;
     cfg->tx_enable       = true;
     cfg->rx_enable       = true;
+    cfg->usb_mount_enable = true;
     cfg->utc_enable      = true;
     cfg->gps_use_pps     = true;
     cfg->tx_slot_parity  = 0;
     cfg->tx_delay_ms     = 0;
     snprintf(cfg->callsign, sizeof(cfg->callsign), "BG7ABC");
     snprintf(cfg->grid,     sizeof(cfg->grid),     "JO70");
+    snprintf(cfg->band,     sizeof(cfg->band),     "40m");
+    cfg->qso_freq_mhz    = 7.074000f;
     cfg->tx.type           = FT8_APP_MSG_CQ;
     cfg->tx.rst_db         = -12;   /* 仅 REPORT / R_REPORT 用，默认给个常用值 */
 
