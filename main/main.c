@@ -498,6 +498,39 @@ static void draw_page_main(void)
         default: break;
         }
     }
+
+    /* 当前步数对应的发射内容预览 */
+    {
+        int y = MAIN_ITEM_Y + MAIN_ITEM_N * 12;   /* 148 */
+        const char *to = cfg.tx.call_to[0] ? cfg.tx.call_to : "-";
+        switch (typ) {
+        case FT8_APP_MSG_CQ:
+            if (cfg.tx.cq_modifier[0])
+                lcd_line(y, CYAN, 12, "CQ %s %s %s", cfg.tx.cq_modifier, cfg.callsign, cfg.grid);
+            else
+                lcd_line(y, CYAN, 12, "CQ %s %s", cfg.callsign, cfg.grid);
+            break;
+        case FT8_APP_MSG_CALL:
+            lcd_line(y, CYAN, 12, "%s %s %s", to, cfg.callsign, cfg.grid);
+            break;
+        case FT8_APP_MSG_REPORT:
+            lcd_line(y, CYAN, 12, "%s %s %+d", to, cfg.callsign, cfg.tx.rst_db);
+            break;
+        case FT8_APP_MSG_R_REPORT:
+            lcd_line(y, CYAN, 12, "%s %s R%+d", to, cfg.callsign, cfg.tx.rst_db);
+            break;
+        case FT8_APP_MSG_RRR:
+            lcd_line(y, CYAN, 12, "%s %s RRR", to, cfg.callsign);
+            break;
+        case FT8_APP_MSG_RR73:
+            lcd_line(y, CYAN, 12, "%s %s RR73", to, cfg.callsign);
+            break;
+        case FT8_APP_MSG_73:
+            lcd_line(y, CYAN, 12, "%s %s 73", to, cfg.callsign);
+            break;
+        default: break;
+        }
+    }
 }
 
 /* ================= 页 1 解码列表(小字, 呼号一行 + 其他一行, 新信息在底部) ================= */
