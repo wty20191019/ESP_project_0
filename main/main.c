@@ -29,6 +29,7 @@
 /* FT8 应用全局配置：以引用交给 ft8_app(需保持有效)；
  * 下面 gps_time_task 会持续把 GPS UTC 时间/日期/PPS 填入 cfg.gps */
 static ft8_app_config_t cfg;
+static volatile bool s_cfg_dirty = false;   /* 配置被修改, 待写入 cfg.txt */
 
 /* 屏幕显示本地时间所用时区(北京 = UTC+8)。UTC 直接显示可改为 0 */
 #define LCD_TZ_HOUR    8
@@ -437,6 +438,7 @@ static void main_adjust(int dir)
     }
     default: break;
     }
+    s_cfg_dirty = true;
 }
 
 static void draw_page_main(void)
@@ -854,6 +856,7 @@ static void ci_key(key_id_t k)
     }
     if (s_ci_sel < s_ci_scroll) s_ci_scroll = s_ci_sel;
     if (s_ci_sel >= s_ci_scroll + 9) s_ci_scroll = s_ci_sel - 8;
+    s_cfg_dirty = true;
 }
 
 static void draw_page_cfg_set(void)
@@ -939,6 +942,14 @@ static void LCD_task(void *arg)
         else if (page == 4) draw_page_cfg_set();    //配置设置, 可设置 cfg 所有内容
 
         LCD_Flush();                       /* 画完一整帧后一次性推送 */
+
+        /* 配置改动后约 2s 落盘到 /storage/cfg.txt */
+        {
+            static uint32_t save_tick = 0;
+            if (s_cfg_dirty && (++save_tick % 100) == 0) {
+                if (cfg_store_save(&cfg) == ESP_OK) s_cfg_dirty = false;
+            }
+        }
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -1139,7 +1150,9 @@ void app_main(void)
     //启动任务============================================================================================
     /* QSO 日志: 注册回调并初始化 FAT 分区 + USB 大容量存储(U盘) */
     ft8_app_set_qso_callback(qso_log_on_qso, NULL);
-    if (qso_log_init(cfg.usb_mount_enable) != ESP_OK)
+    if (qso_log_init(cfg.usb_mount_enable) == ESP_OK)
+        cfg_store_load(&cfg);          /* 用 /storage/cfg.txt 覆盖已持久化的字段 */
+    else
         ESP_LOGW(TAG, "QSO 日志存储初始化失败(不影响收发)");
 
     /* 搬运 GPS UTC 时间/日期/PPS 进 cfg.gps(供 ft8_app UTC 对齐，先启动让它尽早喂数据) */

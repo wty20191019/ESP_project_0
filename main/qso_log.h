@@ -54,6 +54,16 @@ const qso_log_sum_t *qso_log_tail_summary(int idx);
 /** 已加载尾部行数 */
 int qso_log_tail_count(void);
 
+/* ---- cfg.txt: 持久化部分配置(与 log.txt 同目录) ---- */
+#define CFG_STORE_PATH "/storage/cfg.txt"
+/**
+ * @brief 从 cfg.txt 读取并覆盖 cfg 中"被持久化"的字段(文件不存在则保持原值)。
+ *        需在 qso_log_init() 挂载存储之后调用。
+ */
+esp_err_t cfg_store_load(ft8_app_config_t *cfg);
+/** 把 cfg 中"被持久化"的字段写入 cfg.txt(覆盖)。 */
+esp_err_t cfg_store_save(const ft8_app_config_t *cfg);
+
 #ifdef __cplusplus
 }
 #endif

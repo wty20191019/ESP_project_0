@@ -433,3 +433,98 @@ void qso_log_on_qso(const ft8_qso_record_t *rec, void *arg)
     fclose(f);
     ESP_LOGI(TAG, "QSO 已记录: %s", line);
 }
+
+/* ================= cfg.txt 持久化(仅持久化选定字段) ================= */
+static void trim_tail(char *s)
+{
+    size_t l = strlen(s);
+    while (l > 0 && (s[l - 1] == '\n' || s[l - 1] == '\r' || s[l - 1] == ' ')) s[--l] = '\0';
+}
+
+esp_err_t cfg_store_load(ft8_app_config_t *cfg)
+{
+    if (cfg == NULL) return ESP_ERR_INVALID_ARG;
+    FILE *f = fopen(CFG_STORE_PATH, "r");
+    if (f == NULL) return ESP_ERR_NOT_FOUND;
+
+    char line[160];
+    while (fgets(line, sizeof(line), f)) {
+        char *eq = strchr(line, '=');
+        if (eq == NULL) continue;
+        *eq = '\0';
+        char *k = line, *v = eq + 1;
+        while (*k == ' ') k++;
+        while (*v == ' ') v++;
+        trim_tail(v);
+
+        if (!strcmp(k, "callsign")) {
+            strncpy(cfg->callsign, v, sizeof(cfg->callsign) - 1);
+            cfg->callsign[sizeof(cfg->callsign) - 1] = '\0';
+        } else if (!strcmp(k, "grid")) {
+            strncpy(cfg->grid, v, sizeof(cfg->grid) - 1);
+            cfg->grid[sizeof(cfg->grid) - 1] = '\0';
+        } else if (!strcmp(k, "band")) {
+            strncpy(cfg->band, v, sizeof(cfg->band) - 1);
+            cfg->band[sizeof(cfg->band) - 1] = '\0';
+        } else if (!strcmp(k, "qso_freq_mhz")) {
+            cfg->qso_freq_mhz = (float)atof(v);
+        } else if (!strcmp(k, "protocol")) {
+            cfg->protocol = (ftx_protocol_t)atoi(v);
+        } else if (!strcmp(k, "usb_mount_enable")) {
+            cfg->usb_mount_enable = atoi(v) ? true : false;
+        } else if (!strcmp(k, "utc_enable")) {
+            cfg->utc_enable = atoi(v) ? true : false;
+        } else if (!strcmp(k, "gps_utc_enable")) {
+            cfg->gps_utc_enable = atoi(v) ? true : false;
+        } else if (!strcmp(k, "gps_use_pps")) {
+            cfg->gps_use_pps = atoi(v) ? true : false;
+        } else if (!strcmp(k, "tx_slot_parity")) {
+            cfg->tx_slot_parity = atoi(v) & 1;
+        } else if (!strcmp(k, "tx_delay_ms")) {
+            cfg->tx_delay_ms = (uint32_t)strtoul(v, NULL, 10);
+        } else if (!strcmp(k, "audio_level")) {
+            cfg->audio_level = (float)atof(v);
+        } else if (!strcmp(k, "max_candidates")) {
+            cfg->max_candidates = atoi(v);
+        } else if (!strcmp(k, "ldpc_iterations")) {
+            cfg->ldpc_iterations = atoi(v);
+        } else if (!strcmp(k, "rx_parse_ms")) {
+            cfg->rx_parse_ms = (uint32_t)strtoul(v, NULL, 10);
+        } else if (!strcmp(k, "rx_time_osr")) {
+            cfg->rx_time_osr = atoi(v);
+        } else if (!strcmp(k, "rx_freq_osr")) {
+            cfg->rx_freq_osr = atoi(v);
+        }
+    }
+    fclose(f);
+    ESP_LOGI(TAG, "已加载 %s", CFG_STORE_PATH);
+    return ESP_OK;
+}
+
+esp_err_t cfg_store_save(const ft8_app_config_t *cfg)
+{
+    if (cfg == NULL) return ESP_ERR_INVALID_ARG;
+    FILE *f = fopen(CFG_STORE_PATH, "w");
+    if (f == NULL) return ESP_FAIL;
+
+    fprintf(f, "# FT8 cfg (auto generated)\n");
+    fprintf(f, "callsign=%s\n",        cfg->callsign);
+    fprintf(f, "grid=%s\n",            cfg->grid);
+    fprintf(f, "band=%s\n",            cfg->band);
+    fprintf(f, "qso_freq_mhz=%.6f\n",  (double)cfg->qso_freq_mhz);
+    fprintf(f, "protocol=%d\n",        (int)cfg->protocol);
+    fprintf(f, "usb_mount_enable=%d\n", cfg->usb_mount_enable ? 1 : 0);
+    fprintf(f, "utc_enable=%d\n",      cfg->utc_enable ? 1 : 0);
+    fprintf(f, "gps_utc_enable=%d\n",  cfg->gps_utc_enable ? 1 : 0);
+    fprintf(f, "gps_use_pps=%d\n",     cfg->gps_use_pps ? 1 : 0);
+    fprintf(f, "tx_slot_parity=%d\n",  cfg->tx_slot_parity);
+    fprintf(f, "tx_delay_ms=%lu\n",    (unsigned long)cfg->tx_delay_ms);
+    fprintf(f, "audio_level=%.2f\n",   (double)cfg->audio_level);
+    fprintf(f, "max_candidates=%d\n",  cfg->max_candidates);
+    fprintf(f, "ldpc_iterations=%d\n", cfg->ldpc_iterations);
+    fprintf(f, "rx_parse_ms=%lu\n",    (unsigned long)cfg->rx_parse_ms);
+    fprintf(f, "rx_time_osr=%d\n",     cfg->rx_time_osr);
+    fprintf(f, "rx_freq_osr=%d\n",     cfg->rx_freq_osr);
+    fclose(f);
+    return ESP_OK;
+}
