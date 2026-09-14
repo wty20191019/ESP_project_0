@@ -522,14 +522,20 @@ static float rx_measure_snr(const ftx_waterfall_t *wf, const ftx_candidate_t *ca
  * ============================================================ */
 static ft8_rx_log_t s_rx_log;
 
-static void rxlog_add(const char *text, float freq_hz, float snr_db, int64_t slot)
+static void rxlog_add(const char *text, const char *call_to, const char *call_de,
+                      float freq_hz, float snr_db, float dt_s, int64_t slot)
 {
     if (text == NULL) return;
     ft8_rx_msg_t *m = &s_rx_log.msgs[s_rx_log.put];
     strncpy(m->text, text, sizeof(m->text) - 1);
     m->text[sizeof(m->text) - 1] = '\0';
+    m->call_to[0] = '\0';
+    m->call_de[0] = '\0';
+    if (call_to) { strncpy(m->call_to, call_to, sizeof(m->call_to) - 1); m->call_to[sizeof(m->call_to) - 1] = '\0'; }
+    if (call_de) { strncpy(m->call_de, call_de, sizeof(m->call_de) - 1); m->call_de[sizeof(m->call_de) - 1] = '\0'; }
     m->freq_hz = freq_hz;
     m->snr_db  = snr_db;
+    m->dt_s    = dt_s;
     m->slot    = slot;
     s_rx_log.put = (s_rx_log.put + 1) % FT8_RX_MSG_MAX;
     s_rx_log.seq++;
@@ -538,6 +544,12 @@ static void rxlog_add(const char *text, float freq_hz, float snr_db, int64_t slo
 const ft8_rx_log_t *ft8_rx_log(void)
 {
     return &s_rx_log;
+}
+
+void ft8_rx_log_clear(void)
+{
+    s_rx_log.put = 0;
+    s_rx_log.seq = 0;
 }
 
 bool ft8_app_tx_busy(void)
@@ -630,7 +642,19 @@ static void rx_decode_slot(monitor_t *mon, int64_t prev_slot, int64_t budget_us)
         qso_rx_publish(&msg, f_hz, snr_db, prev_slot);
 
         /* 存入最近解码环形(供 LCD RX 页) */
-        rxlog_add(text, f_hz, snr_db, prev_slot);
+        char mto[16] = {0}, mde[16] = {0};
+        {
+            ftx_message_type_t mt = ftx_message_get_type(&msg);
+            if (mt == FTX_MESSAGE_TYPE_STANDARD || mt == FTX_MESSAGE_TYPE_NONSTD_CALL) {
+                char ex[12];
+                ftx_field_t ft[FTX_MAX_MESSAGE_FIELDS];
+                if (mt == FTX_MESSAGE_TYPE_STANDARD)
+                    ftx_message_decode_std(&msg, &s_hash_if, mto, mde, ex, ft);
+                else
+                    ftx_message_decode_nonstd(&msg, &s_hash_if, mto, mde, ex, ft);
+            }
+        }
+        rxlog_add(text, mto, mde, f_hz, snr_db, t_s, prev_slot);
 
         s_stat_decoded++;
         ESP_LOGI(T, "[RX] %s @%0.0fHz t=%0.2fs SNR=%s: %s",

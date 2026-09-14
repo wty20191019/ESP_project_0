@@ -52,8 +52,11 @@ const ft8_wf_snap_t *ft8_wf_snap(void);
 #define FT8_RX_MSG_MAX 16
 typedef struct {
     char     text[40];      /*!< 解码文本 */
+    char     call_to[16];   /*!< 目标呼号(可能为 CQ/QRZ token) */
+    char     call_de[16];   /*!< 发射方呼号(= 对方) */
     float    freq_hz;       /*!< 音频频率 */
     float    snr_db;        /*!< 估算 SNR(NAN=未知) */
+    float    dt_s;          /*!< 时间差(相对时隙起点, 秒) */
     int64_t  slot;          /*!< 所在时隙号 */
 } ft8_rx_msg_t;
 
@@ -65,6 +68,9 @@ typedef struct {
 
 /** 取最近解码消息环形缓冲(无锁) */
 const ft8_rx_log_t *ft8_rx_log(void);
+
+/** 清空最近解码消息缓冲(供界面“清空列表”) */
+void ft8_rx_log_clear(void);
 
 /** 当前是否正在发射(供状态栏显示 TX/RX) */
 bool ft8_app_tx_busy(void);
