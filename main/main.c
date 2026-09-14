@@ -470,24 +470,34 @@ static void draw_page_TX(void)
     lcd_row(9, cfg.tx_enable ? GREEN : GRAY, "TX  %s", cfg.tx_enable ? "ON" : "OFF");
 }
 
-/* ================= 页 6: QSO 日志 ================= */
-static int s_log_scroll = 0;
+/* ================= 页 6: 日志(log.txt 内容) ================= */
+static int s_log_scroll = 9999;    /* 初始贴到底部(最新), 绘制时按行数收敛 */
+static int s_log_hscroll = 0;
+static int s_log_tick = 0;
 
 static void draw_page_log(void)
 {
-    int n = qso_log_lines();
-    lcd_row(0, CYAN, "QSO LOG %d", n);
+    /* 约每 1s 重新读取一次文件尾部(读失败保留旧内容) */
+    if ((s_log_tick++ % 50) == 0) qso_log_tail(QSO_TAIL_MAX);
+
+    int n = qso_log_tail_count();
+    lcd_row(0, CYAN, "log.txt %d", n);
     if (n == 0) {
-        lcd_row(4, GRAY, "no QSO yet");
+        lcd_row(4, GRAY, "empty / usb busy");
         return;
     }
     if (s_log_scroll > n - 1) s_log_scroll = n - 1;
     if (s_log_scroll < 0) s_log_scroll = 0;
+
     for (int k = 0; k < 9 && (s_log_scroll + k) < n; k++) {
-        const char *line = qso_log_line(s_log_scroll + k);
-        lcd_row(1 + k, WHITE, "%s", line ? line : "");
+        const char *line = qso_log_tail_line(s_log_scroll + k);
+        if (line == NULL) break;
+        int len = (int)strlen(line);
+        int off = s_log_hscroll;
+        if (off > len) off = len;
+        lcd_row(1 + k, WHITE, "%s", line + off);
     }
-    lcd_row(9, GRAY, "scroll %d/%d", s_log_scroll, n > 9 ? n - 9 : 0);
+    lcd_row(9, GRAY, "s%02d h%03d", s_log_scroll, s_log_hscroll);
 }
 
 /* ================= 页 7: 配置设置(可编辑 cfg 所有主要项) ================= */
@@ -543,55 +553,84 @@ static int s_ci_scroll = 0;
 static int s_ci_cursor = 0;
 static const char s_ci_charset[] = " ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/.-";
 
-static void ci_adjust(const ci_item_t *it, int dir)
+/* 把配置项当前值格式化成字符串(与显示一致), 返回长度 */
+static int ci_value_str(const ci_item_t *it, char *out, size_t cap)
 {
+    out[0] = '\0';
     switch (it->type) {
-    case CI_BOOL:
-        *(bool *)it->ptr = !*(bool *)it->ptr;
-        break;
-    case CI_INT: {
-        int v = *(int *)it->ptr + dir * (int)it->step;
-        if (v < (int)it->vmin) v = (int)it->vmin;
-        if (v > (int)it->vmax) v = (int)it->vmax;
-        *(int *)it->ptr = v;
-        break;
-    }
-    case CI_U32: {
-        int v = (int)*(uint32_t *)it->ptr + dir * (int)it->step;
-        if (v < (int)it->vmin) v = (int)it->vmin;
-        if (v > (int)it->vmax) v = (int)it->vmax;
-        *(uint32_t *)it->ptr = (uint32_t)v;
-        break;
-    }
-    case CI_FLOAT: {
-        float v = *(float *)it->ptr + dir * it->step;
-        if (v < it->vmin) v = it->vmin;
-        if (v > it->vmax) v = it->vmax;
-        *(float *)it->ptr = v;
-        break;
-    }
+    case CI_BOOL:  snprintf(out, cap, "%s", *(bool *)it->ptr ? "Y" : "N"); break;
+    case CI_INT:   snprintf(out, cap, "%d", *(int *)it->ptr); break;
+    case CI_U32:   snprintf(out, cap, "%lu", (unsigned long)*(uint32_t *)it->ptr); break;
+    case CI_FLOAT: snprintf(out, cap, "%.*f", it->dec, (double)*(float *)it->ptr); break;
+    case CI_STR:   snprintf(out, cap, "%s", (char *)it->ptr); break;
     case CI_ENUM: {
+        int v = *(int *)it->ptr;
+        if (v < 0 || v >= it->nopts) v = 0;
+        snprintf(out, cap, "%s", it->opts[v]);
+        break;
+    }
+    default: break;
+    }
+    return (int)strlen(out);
+}
+
+/* 按 dir 修改"当前光标所在的那一位": 数值改该位数字(不进位), 字符串换字符, 枚举/布尔整体切换 */
+static void ci_edit_char(const ci_item_t *it, int dir)
+{
+    if (it->type == CI_BOOL) { *(bool *)it->ptr = !*(bool *)it->ptr; return; }
+    if (it->type == CI_ENUM) {
         int v = *(int *)it->ptr + dir;
         if (v < 0) v = it->nopts - 1;
         if (v >= it->nopts) v = 0;
         *(int *)it->ptr = v;
-        break;
+        return;
     }
-    case CI_STR: {
-        char *s = (char *)it->ptr;
-        int len = it->len;
-        int cur = s_ci_cursor;
-        if (cur < 0) cur = 0;
-        if (cur >= len - 1) cur = len - 2;
-        const char *p = strchr(s_ci_charset, s[cur]);
+
+    char v[24];
+    int len = ci_value_str(it, v, sizeof(v));
+    if (len <= 0) return;
+    int pos = s_ci_cursor;
+    if (pos < 0) pos = 0;
+    if (pos >= len) pos = len - 1;
+    char c = v[pos];
+
+    if (it->type == CI_STR) {
+        const char *p = strchr(s_ci_charset, c);
         int idx = p ? (int)(p - s_ci_charset) : 0;
         int setn = (int)strlen(s_ci_charset);
         idx = (idx + dir + setn) % setn;
-        s[cur] = s_ci_charset[idx];
-        if (s[cur] && cur + 1 < len && s[cur + 1] == '\0') s[cur + 1] = '\0';
-        break;
+        char *s = (char *)it->ptr;
+        s[pos] = s_ci_charset[idx];
+        if (s[pos] && pos + 1 < it->len && s[pos + 1] == '\0') s[pos + 1] = '\0';
+        return;
     }
-    default: break;
+
+    /* 数值: 只改该位字符, 再解析回字段 */
+    if (c >= '0' && c <= '9') {
+        int d = c - '0';
+        d = (d + dir + 10) % 10;
+        v[pos] = (char)('0' + d);
+    } else if ((c == '-' || c == '+') && pos == 0) {
+        v[0] = (c == '-') ? '+' : '-';
+    } else {
+        return;
+    }
+
+    if (it->type == CI_INT) {
+        long x = strtol(v, NULL, 10);
+        if (x < (long)it->vmin) x = (long)it->vmin;
+        if (x > (long)it->vmax) x = (long)it->vmax;
+        *(int *)it->ptr = (int)x;
+    } else if (it->type == CI_U32) {
+        long x = strtol(v, NULL, 10);
+        if (x < (long)it->vmin) x = (long)it->vmin;
+        if (x > (long)it->vmax) x = (long)it->vmax;
+        *(uint32_t *)it->ptr = (uint32_t)x;
+    } else if (it->type == CI_FLOAT) {
+        double x = strtod(v, NULL);
+        if (x < (double)it->vmin) x = it->vmin;
+        if (x > (double)it->vmax) x = it->vmax;
+        *(float *)it->ptr = (float)x;
     }
 }
 
@@ -601,13 +640,20 @@ static void ci_key(key_id_t k)
     switch (k) {
     case KEY_ID_UP:    if (s_ci_sel > 0) s_ci_sel--; break;
     case KEY_ID_DOWN:  if (s_ci_sel < CI_N - 1) s_ci_sel++; break;
-    case KEY_ID_LEFT:  ci_adjust(it, -1); break;
-    case KEY_ID_RIGHT: ci_adjust(it, +1); break;
-    case KEY_ID_MID:
-        if (it->type == CI_STR) {
-            s_ci_cursor = (s_ci_cursor + 1) % (it->len - 1);
+    case KEY_ID_LEFT:  ci_edit_char(it, -1); break;
+    case KEY_ID_RIGHT: ci_edit_char(it, +1); break;
+    case KEY_ID_MID: {
+        /* 光标右移到下一位(字符串/数值按值长度, 枚举/布尔固定 1 位) */
+        int vlen = 1;
+        if (it->type == CI_STR || it->type == CI_INT ||
+            it->type == CI_U32 || it->type == CI_FLOAT) {
+            char v[24];
+            vlen = ci_value_str(it, v, sizeof(v));
+            if (vlen < 1) vlen = 1;
         }
+        s_ci_cursor = (s_ci_cursor + 1) % vlen;
         break;
+    }
     default: break;
     }
     if (s_ci_sel < s_ci_scroll) s_ci_scroll = s_ci_sel;
@@ -617,26 +663,53 @@ static void ci_key(key_id_t k)
 static void draw_page_cfg_set(void)
 {
     lcd_row(0, CYAN, "CFG SET %d/%d", s_ci_sel + 1, CI_N);
+
     for (int r = 0; r < 9; r++) {
         int i = s_ci_scroll + r;
         if (i >= CI_N) break;
         const ci_item_t *it = &s_ci[i];
-        const char *pre = (i == s_ci_sel) ? ">" : " ";
-        uint16_t col = (i == s_ci_sel) ? YELLOW : WHITE;
-        switch (it->type) {
-        case CI_BOOL:  lcd_row(1 + r, col, "%s%s %s", pre, it->name, *(bool *)it->ptr ? "Y" : "N"); break;
-        case CI_INT:   lcd_row(1 + r, col, "%s%s %d", pre, it->name, *(int *)it->ptr); break;
-        case CI_U32:   lcd_row(1 + r, col, "%s%s %lu", pre, it->name, (unsigned long)*(uint32_t *)it->ptr); break;
-        case CI_FLOAT: lcd_row(1 + r, col, "%s%s %.*f", pre, it->name, it->dec, (double)*(float *)it->ptr); break;
-        case CI_STR:   lcd_row(1 + r, col, "%s%s %s", pre, it->name, (char *)it->ptr); break;
-        case CI_ENUM: {
-            int v = *(int *)it->ptr;
-            if (v < 0 || v >= it->nopts) v = 0;
-            lcd_row(1 + r, col, "%s%s %s", pre, it->name, it->opts[v]);
-            break;
+
+        if (i != s_ci_sel) {
+            switch (it->type) {
+            case CI_BOOL:  lcd_row(1 + r, WHITE, " %s %s", it->name, *(bool *)it->ptr ? "Y" : "N"); break;
+            case CI_INT:   lcd_row(1 + r, WHITE, " %s %d", it->name, *(int *)it->ptr); break;
+            case CI_U32:   lcd_row(1 + r, WHITE, " %s %lu", it->name, (unsigned long)*(uint32_t *)it->ptr); break;
+            case CI_FLOAT: lcd_row(1 + r, WHITE, " %s %.*f", it->name, it->dec, (double)*(float *)it->ptr); break;
+            case CI_STR:   lcd_row(1 + r, WHITE, " %s %s", it->name, (char *)it->ptr); break;
+            case CI_ENUM: {
+                int v = *(int *)it->ptr;
+                if (v < 0 || v >= it->nopts) v = 0;
+                lcd_row(1 + r, WHITE, " %s %s", it->name, it->opts[v]);
+                break;
+            }
+            default: break;
+            }
+            continue;
         }
-        default: break;
-        }
+
+        /* 选中行: 手工绘制, 并把光标所在位用反色(黑字黄底)高亮 */
+        char val[24];
+        int vlen = ci_value_str(it, val, sizeof(val));
+        int pos = s_ci_cursor;
+        if (pos < 0) pos = 0;
+        if (vlen > 0 && pos >= vlen) pos = vlen - 1;
+        if (vlen == 0) pos = 0;
+
+        char head[16];
+        int hl = 0;
+        head[hl++] = '>';
+        for (const char *s = it->name; *s && hl < 13; ) head[hl++] = *s++;
+        head[hl++] = ' ';
+        head[hl] = '\0';
+
+        int y = 16 * (1 + r);
+        LCD_Fill(0, (uint16_t)y, LCD_W, (uint16_t)(y + 16), BLACK);
+        LCD_ShowString(0, (uint16_t)y, (const uint8_t *)head, YELLOW, BLACK, 16, 0);
+        LCD_ShowString((uint16_t)(hl * 8), (uint16_t)y, (const uint8_t *)val, YELLOW, BLACK, 16, 0);
+
+        int cx = hl + pos;
+        if (vlen > 0 && cx < 16)
+            LCD_ShowChar((uint16_t)(cx * 8), (uint16_t)y, (uint8_t)val[pos], BLACK, YELLOW, 16, 0);
     }
 }
 
@@ -776,10 +849,13 @@ static void my_key_callback(key_id_t key_id, key_event_t event, void *user_data)
         return;
     }
 
-    if (page == 6) {                       /* 日志页: 上下滚动 */
-        if (key_id == KEY_ID_UP)        s_log_scroll++;
-        else if (key_id == KEY_ID_DOWN) s_log_scroll--;
+    if (page == 6) {                       /* 日志页: 上下选行, 左右横向滚动 */
+        if (key_id == KEY_ID_UP)         s_log_scroll--;   /* 更旧 */
+        else if (key_id == KEY_ID_DOWN)  s_log_scroll++;   /* 更新 */
+        else if (key_id == KEY_ID_LEFT)  s_log_hscroll--;
+        else if (key_id == KEY_ID_RIGHT) s_log_hscroll++;
         if (s_log_scroll < 0) s_log_scroll = 0;
+        if (s_log_hscroll < 0) s_log_hscroll = 0;
         return;
     }
 

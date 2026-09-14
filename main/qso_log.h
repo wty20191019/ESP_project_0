@@ -27,6 +27,19 @@ const char *qso_log_line(int idx);
 /** 当前缓存条数 */
 int qso_log_lines(void);
 
+/* ---- 直接读取 /storage/log.txt 尾部若干行(供日志页浏览文件内容) ---- */
+#define QSO_TAIL_MAX 48
+/**
+ * @brief 读取 log.txt 最后 max_lines 行到内部缓冲(最多 QSO_TAIL_MAX 行)。
+ *        读失败(如被 USB 主机占用)时保留上次内容。
+ * @return 当前缓冲行数
+ */
+int qso_log_tail(int max_lines);
+/** 取已加载尾部行的第 idx 行(idx 0 = 最旧); 越界返回 NULL */
+const char *qso_log_tail_line(int idx);
+/** 已加载尾部行数 */
+int qso_log_tail_count(void);
+
 #ifdef __cplusplus
 }
 #endif

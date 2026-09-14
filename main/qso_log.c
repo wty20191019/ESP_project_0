@@ -69,6 +69,52 @@ static void qso_log_ram_add(const ft8_qso_record_t *rec)
     if (s_line_n < QSO_LOG_RAM_MAX) s_line_n++;
 }
 
+/* ---------------- 读取 log.txt 尾部行 ---------------- */
+static char s_tail[QSO_TAIL_MAX][128];
+static int  s_tail_n = 0;
+
+const char *qso_log_tail_line(int idx)
+{
+    if (idx < 0 || idx >= s_tail_n) return NULL;
+    return s_tail[idx];
+}
+
+int qso_log_tail_count(void)
+{
+    return s_tail_n;
+}
+
+int qso_log_tail(int max_lines)
+{
+    if (max_lines <= 0) max_lines = QSO_TAIL_MAX;
+    if (max_lines > QSO_TAIL_MAX) max_lines = QSO_TAIL_MAX;
+
+    FILE *f = fopen(QSO_LOG_PATH, "r");
+    if (f == NULL) return s_tail_n;     /* 被主机占用等: 保留旧内容 */
+
+    /* 滚动窗口: 始终保留最后 max_lines 行 */
+    char buf[128];
+    int n = 0;
+    while (fgets(buf, sizeof(buf), f)) {
+        size_t l = strlen(buf);
+        while (l > 0 && (buf[l - 1] == '\n' || buf[l - 1] == '\r')) buf[--l] = '\0';
+        if (n < max_lines) {
+            strncpy(s_tail[n], buf, sizeof(s_tail[0]) - 1);
+            s_tail[n][sizeof(s_tail[0]) - 1] = '\0';
+            n++;
+        } else {
+            for (int i = 1; i < max_lines; i++)
+                memcpy(s_tail[i - 1], s_tail[i], sizeof(s_tail[0]));
+            strncpy(s_tail[max_lines - 1], buf, sizeof(s_tail[0]) - 1);
+            s_tail[max_lines - 1][sizeof(s_tail[0]) - 1] = '\0';
+        }
+    }
+    fclose(f);
+
+    s_tail_n = n;
+    return s_tail_n;
+}
+
 /* ---------------- ADIF 拼接 ---------------- */
 /* 手工拼接, 不用 snprintf 的 %s(避免 -Werror=format-truncation) */
 static int adif_add(char *buf, int pos, int cap, const char *name, const char *val)
