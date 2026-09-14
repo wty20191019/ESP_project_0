@@ -29,14 +29,25 @@ int qso_log_lines(void);
 
 /* ---- 直接读取 /storage/log.txt 尾部若干行(供日志页浏览文件内容) ---- */
 #define QSO_TAIL_MAX 48
+
+/* 从 ADIF 行解析出的摘要(呼号/网格/信号/频率) */
+typedef struct {
+    char call[16];
+    char grid[8];
+    char rst[8];
+    char freq[12];
+} qso_log_sum_t;
+
 /**
- * @brief 读取 log.txt 最后 max_lines 行到内部缓冲(最多 QSO_TAIL_MAX 行)。
+ * @brief 读取 log.txt 最后 max_lines 行到内部缓冲(最多 QSO_TAIL_MAX 行), 并解析摘要。
  *        读失败(如被 USB 主机占用)时保留上次内容。
  * @return 当前缓冲行数
  */
 int qso_log_tail(int max_lines);
-/** 取已加载尾部行的第 idx 行(idx 0 = 最旧); 越界返回 NULL */
+/** 取已加载尾部行的第 idx 行原文(idx 0 = 最旧); 越界返回 NULL */
 const char *qso_log_tail_line(int idx);
+/** 取第 idx 行的解析摘要(idx 0 = 最旧); 越界返回 NULL */
+const qso_log_sum_t *qso_log_tail_summary(int idx);
 /** 已加载尾部行数 */
 int qso_log_tail_count(void);
 

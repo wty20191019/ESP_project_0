@@ -66,6 +66,9 @@ typedef struct {
 /** 取最近解码消息环形缓冲(无锁) */
 const ft8_rx_log_t *ft8_rx_log(void);
 
+/** 当前是否正在发射(供状态栏显示 TX/RX) */
+bool ft8_app_tx_busy(void);
+
 /**
  * 发射消息类型：标准一次通联的 6 类内容。
  * 文本一律以本机(呼号=callsign)为发送方视角拼接，格式为：

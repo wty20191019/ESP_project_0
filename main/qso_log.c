@@ -15,6 +15,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <stdlib.h>
 
 #include "sdkconfig.h"
 #include "soc/soc_caps.h"
@@ -71,12 +72,53 @@ static void qso_log_ram_add(const ft8_qso_record_t *rec)
 
 /* ---------------- 读取 log.txt 尾部行 ---------------- */
 static char s_tail[QSO_TAIL_MAX][128];
+static qso_log_sum_t s_tail_sum[QSO_TAIL_MAX];
 static int  s_tail_n = 0;
+
+/* 从 ADIF 行取某标签的值(如 call/gridsquare/rst_rcvd/freq) */
+static void adif_field(const char *line, const char *tag, char *out, size_t cap)
+{
+    out[0] = '\0';
+    char pat[24];
+    size_t pl = 0;
+    pat[pl++] = '<';
+    for (const char *t = tag; *t && pl < sizeof(pat) - 3; ) pat[pl++] = *t++;
+    pat[pl++] = ':';
+    pat[pl] = '\0';
+
+    const char *p = strstr(line, pat);
+    if (p == NULL) return;
+    p += pl;
+    int len = atoi(p);
+    const char *v = strchr(p, '>');
+    if (v == NULL) return;
+    v++;
+    if (len < 0) len = 0;
+    size_t n = (size_t)len;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, v, n);
+    out[n] = '\0';
+}
+
+static void adif_parse_sum(const char *line, qso_log_sum_t *s)
+{
+    memset(s, 0, sizeof(*s));
+    adif_field(line, "call",       s->call, sizeof(s->call));
+    adif_field(line, "gridsquare", s->grid, sizeof(s->grid));
+    adif_field(line, "rst_rcvd",   s->rst,  sizeof(s->rst));
+    adif_field(line, "freq",       s->freq, sizeof(s->freq));
+}
 
 const char *qso_log_tail_line(int idx)
 {
     if (idx < 0 || idx >= s_tail_n) return NULL;
     return s_tail[idx];
+}
+
+const qso_log_sum_t *qso_log_tail_summary(int idx)
+{
+    if (idx < 0 || idx >= s_tail_n) return NULL;
+    return &s_tail_sum[idx];
 }
 
 int qso_log_tail_count(void)
@@ -92,7 +134,7 @@ int qso_log_tail(int max_lines)
     FILE *f = fopen(QSO_LOG_PATH, "r");
     if (f == NULL) return s_tail_n;     /* 被主机占用等: 保留旧内容 */
 
-    /* 滚动窗口: 始终保留最后 max_lines 行 */
+    /* 滚动窗口: 始终保留最后 max_lines 行(原文 + 解析摘要) */
     char buf[128];
     int n = 0;
     while (fgets(buf, sizeof(buf), f)) {
@@ -101,12 +143,16 @@ int qso_log_tail(int max_lines)
         if (n < max_lines) {
             strncpy(s_tail[n], buf, sizeof(s_tail[0]) - 1);
             s_tail[n][sizeof(s_tail[0]) - 1] = '\0';
+            adif_parse_sum(s_tail[n], &s_tail_sum[n]);
             n++;
         } else {
-            for (int i = 1; i < max_lines; i++)
+            for (int i = 1; i < max_lines; i++) {
                 memcpy(s_tail[i - 1], s_tail[i], sizeof(s_tail[0]));
+                s_tail_sum[i - 1] = s_tail_sum[i];
+            }
             strncpy(s_tail[max_lines - 1], buf, sizeof(s_tail[0]) - 1);
             s_tail[max_lines - 1][sizeof(s_tail[0]) - 1] = '\0';
+            adif_parse_sum(s_tail[max_lines - 1], &s_tail_sum[max_lines - 1]);
         }
     }
     fclose(f);
