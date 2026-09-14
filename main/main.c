@@ -403,43 +403,101 @@ static void draw_waterfall(int y0, int h)
     }
 }
 
-/* ================= 页 0 主操作页(仿 FT8CN): 状态栏 + 瀑布 + 刻度 + 发射 =================
- * 解码列表单独放在页 1 */
-#define MAIN_WF_Y     16
-#define MAIN_WF_H     96                               /* y16..111 */
-#define MAIN_SCALE_Y  (MAIN_WF_Y + MAIN_WF_H)          /* 112 -> row7 */
-#define MAIN_TX_Y     (MAIN_SCALE_Y + 16)              /* 128 -> row8 */
+/* ================= 页 0 主操作页(仿 FT8CN, 小字): 状态 + 瀑布(含AF红线) + 发射设置 ================= */
+#define MAIN_WF_Y   12
+#define MAIN_WF_H   76                  /* y12..87 */
+#define MAIN_SCALE_Y (MAIN_WF_Y + MAIN_WF_H)   /* 88 */
+#define MAIN_ITEM_Y  (MAIN_SCALE_Y + 12)       /* 100, 4 项 * 12px = 48 -> 148 */
+
+#define MAIN_ITEM_N 4
+static int s_main_sel = 0;              /* 0=TX开关 1=步数 2=时隙 3=音频频率 */
+
+static void main_adjust(int dir)
+{
+    switch (s_main_sel) {
+    case 0:
+        cfg.tx_enable = !cfg.tx_enable;
+        break;
+    case 1: {
+        int v = (int)cfg.tx.type + dir;
+        if (v < 0) v = 6;
+        if (v > 6) v = 0;
+        cfg.tx.type = (ft8_app_msg_type_t)v;
+        break;
+    }
+    case 2:
+        cfg.tx_slot_parity = (cfg.tx_slot_parity & 1) ? 0 : 1;
+        break;
+    case 3: {
+        float f = cfg.audio_freq_hz + dir * 50.0f;
+        if (f < 100.0f)  f = 100.0f;
+        if (f > 3000.0f) f = 3000.0f;
+        cfg.audio_freq_hz = f;
+        break;
+    }
+    default: break;
+    }
+}
 
 static void draw_page_main(void)
 {
-    /* 顶部状态栏: 频率 MHz + UTC; 右侧 TX(红)/RX(绿) 单独上色 */
     bool tx = ft8_app_tx_busy();
+
+    /* 状态栏(小字): 频率 MHz + UTC; 右侧 TX(红)/RX(绿) */
     if (cfg.qso_freq_mhz > 0.0f)
-        lcd_row(0, WHITE, "%.3f %02u%02u%02u", (double)cfg.qso_freq_mhz,
-                cfg.gps.valid ? cfg.gps.hour : 0,
-                cfg.gps.valid ? cfg.gps.minute : 0,
-                cfg.gps.valid ? cfg.gps.second : 0);
+        lcd_line(0, WHITE, 12, "%.3f %02u%02u%02u", (double)cfg.qso_freq_mhz,
+                 cfg.gps.valid ? cfg.gps.hour : 0,
+                 cfg.gps.valid ? cfg.gps.minute : 0,
+                 cfg.gps.valid ? cfg.gps.second : 0);
     else
-        lcd_row(0, WHITE, "%s %02u%02u%02u", cfg.band[0] ? cfg.band : "---",
-                cfg.gps.valid ? cfg.gps.hour : 0,
-                cfg.gps.valid ? cfg.gps.minute : 0,
-                cfg.gps.valid ? cfg.gps.second : 0);
-    LCD_ShowString((uint16_t)(LCD_W - 16), 0, (const uint8_t *)(tx ? "TX" : "RX"),
-                   tx ? RED : GREEN, BLACK, 16, 0);
+        lcd_line(0, WHITE, 12, "%s %02u%02u%02u", cfg.band[0] ? cfg.band : "---",
+                 cfg.gps.valid ? cfg.gps.hour : 0,
+                 cfg.gps.valid ? cfg.gps.minute : 0,
+                 cfg.gps.valid ? cfg.gps.second : 0);
+    LCD_ShowString((uint16_t)(LCD_W - 12), 0, (const uint8_t *)(tx ? "TX" : "RX"),
+                   tx ? RED : GREEN, BLACK, 12, 0);
 
-    /* 瀑布 */
+    /* 瀑布 + 音频频率红线定位 */
     draw_waterfall(MAIN_WF_Y, MAIN_WF_H);
+    if (cfg.rx_f_max > cfg.rx_f_min) {
+        int x = (int)((cfg.audio_freq_hz - cfg.rx_f_min) * (LCD_W - 1) /
+                      (cfg.rx_f_max - cfg.rx_f_min));
+        if (x < 0) x = 0;
+        if (x > LCD_W - 1) x = LCD_W - 1;
+        LCD_Fill((uint16_t)x, MAIN_WF_Y, (uint16_t)(x + 1),
+                 (uint16_t)(MAIN_WF_Y + MAIN_WF_H), RED);
+    }
 
-    /* 频率刻度(左低右高) */
-    lcd_row(7, GRAY, "%.3gk-%.3gk",
-            (double)cfg.rx_f_min / 1000.0, (double)cfg.rx_f_max / 1000.0);
+    /* 频率刻度 */
+    lcd_line(MAIN_SCALE_Y, GRAY, 12, "%.3gk-%.3gk",
+             (double)cfg.rx_f_min / 1000.0, (double)cfg.rx_f_max / 1000.0);
 
-    /* 发射信息 */
+    /* 设置项(小字, 选中反色) */
     int typ = (int)cfg.tx.type;
     if (typ < 0 || typ > 6) typ = 0;
-    lcd_row(8, cfg.tx_enable ? GREEN : GRAY, "TX %s %s", s_msg_opts[typ],
-            cfg.tx.call_to[0] ? cfg.tx.call_to : cfg.callsign);
-    lcd_row(9, WHITE, "%s %s RST%+d", cfg.callsign, cfg.grid, cfg.tx.rst_db);
+    for (int i = 0; i < MAIN_ITEM_N; i++) {
+        int y = MAIN_ITEM_Y + i * 12;
+        bool sel = (i == s_main_sel);
+        switch (i) {
+        case 0:
+            if (sel) lcd_line_bg(y, 12, BLACK, YELLOW, "TX  %s", cfg.tx_enable ? "ON" : "OFF");
+            else     lcd_line(y, cfg.tx_enable ? GREEN : GRAY, 12, "TX  %s", cfg.tx_enable ? "ON" : "OFF");
+            break;
+        case 1:
+            if (sel) lcd_line_bg(y, 12, BLACK, YELLOW, "STEP %s", s_msg_opts[typ]);
+            else     lcd_line(y, WHITE, 12, "STEP %s", s_msg_opts[typ]);
+            break;
+        case 2:
+            if (sel) lcd_line_bg(y, 12, BLACK, YELLOW, "SLOT %s", (cfg.tx_slot_parity & 1) ? "odd" : "even");
+            else     lcd_line(y, WHITE, 12, "SLOT %s", (cfg.tx_slot_parity & 1) ? "odd" : "even");
+            break;
+        case 3:
+            if (sel) lcd_line_bg(y, 12, BLACK, YELLOW, "AF   %.0fHz", cfg.audio_freq_hz);
+            else     lcd_line(y, WHITE, 12, "AF   %.0fHz", cfg.audio_freq_hz);
+            break;
+        default: break;
+        }
+    }
 }
 
 /* ================= 页 1 解码列表(小字, 呼号一行 + 其他一行, 新信息在底部) ================= */
@@ -939,6 +997,14 @@ static void my_key_callback(key_id_t key_id, key_event_t event, void *user_data)
     if (key_id == KEY_ID_RST) {
         s_lcd_page = (page + 1) % LCD_PAGE_NUM;
         ESP_LOGI("APP", "RST 下一页 -> %d", s_lcd_page);
+        return;
+    }
+
+    if (page == 0) {                       /* 主页: 上下选设置项, 左右调整(长按连续) */
+        if (key_id == KEY_ID_UP)        { if (s_main_sel > 0) s_main_sel--; }
+        else if (key_id == KEY_ID_DOWN) { if (s_main_sel < MAIN_ITEM_N - 1) s_main_sel++; }
+        else if (key_id == KEY_ID_LEFT)  main_adjust(-1);
+        else if (key_id == KEY_ID_RIGHT) main_adjust(+1);
         return;
     }
 
