@@ -4,6 +4,7 @@
 #include "esp_err.h"
 #include "ft8/constants.h"
 #include "ft8/message.h"
+#include "ft8_qso.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -46,6 +47,27 @@ typedef struct {
  * @return 快照指针; 音频/缓冲未就绪时为 NULL。
  */
 const ft8_wf_snap_t *ft8_wf_snap(void);
+
+/* ---- 最近解码消息(供 LCD 的 RX 页显示) ---- */
+#define FT8_RX_MSG_MAX 16
+typedef struct {
+    char     text[40];      /*!< 解码文本 */
+    float    freq_hz;       /*!< 音频频率 */
+    float    snr_db;        /*!< 估算 SNR(NAN=未知) */
+    int64_t  slot;          /*!< 所在时隙号 */
+} ft8_rx_msg_t;
+
+typedef struct {
+    volatile uint32_t seq;  /*!< 每新增一条 +1 */
+    volatile uint32_t put;  /*!< 下一条写入下标; 最新 = (put-1+MAX)%MAX */
+    ft8_rx_msg_t msgs[FT8_RX_MSG_MAX];
+} ft8_rx_log_t;
+
+/** 取最近解码消息环形缓冲(无锁) */
+const ft8_rx_log_t *ft8_rx_log(void);
+
+/** 当前是否正在发射(供状态栏显示 TX/RX) */
+bool ft8_app_tx_busy(void);
 
 /**
  * 发射消息类型：标准一次通联的 6 类内容。
@@ -106,69 +128,6 @@ typedef struct {
 } ft8_app_gps_time_t;
 
 
-/* 结构化解码消息(RX 任务 -> 引擎队列) */
-typedef struct {
-    ftx_message_type_t msg_type;
-    char call_to[16];
-    char call_de[16];
-    char extra[12];
-    ftx_field_t ftypes[FTX_MAX_MESSAGE_FIELDS];
-    float freq_hz;
-    float snr_db;
-    int64_t slot;
-} qso_rx_t;
-
-/* 语义事件(已按"发射方视角"归一化) */
-typedef enum {
-    QSO_EVT_NONE,   /* 与本站无关 */
-    QSO_EVT_CQ,     /* 对方呼叫 CQ(可应答) */
-    QSO_EVT_ANSWER, /* 对方回答我方 CQ(点我方呼号 + 网格) */
-    QSO_EVT_REPORT, /* 对方发我方信号报告(不带 R) */
-    QSO_EVT_RREPORT,/* 对方发我方 R 报告 */
-    QSO_EVT_RRR,    /* 对方 RRR */
-    QSO_EVT_RR73,   /* 对方 RR73 */
-    QSO_EVT_73,     /* 对方 73 */
-} qso_evt_kind_t;
-
-typedef struct {
-    qso_evt_kind_t kind;
-    char sender[16];   /* 发射方呼号 */
-    char grid[8];      /* 网格(仅 CQ/ANSWER) */
-    int  rst_db;       /* 报告 dB(仅报告类) */
-    int  parity;       /* 收到该消息的时隙奇偶(= 对方发射相位) */
-} qso_evt_t;
-
-/* QSO 状态机阶段(每阶段对应一份我方要发的 cfg.tx 内容) */
-typedef enum {
-    QSO_ST_IDLE,        /* 空闲: 主叫模式=CQ, 应答模式=静默 */
-    QSO_ST_REPORT,      /* 主叫: 已发 REPORT, 等对方 R 报告/结束 */
-    QSO_ST_RR73,        /* 主叫: 已发 RR73, 等对方 73 */
-    QSO_ST_CALL,        /* 应答: 已发 CALL, 等对方 REPORT */
-    QSO_ST_RRPT,        /* 应答: 已发 R 报告, 等对方 RR73/RRR */
-    QSO_ST_73,          /* 应答: 已决定发 73, 发完即完成 */
-} qso_state_t;
-
-/* 引擎任务运行时上下文 */
-typedef struct {
-    qso_state_t state;
-    bool engaged;           /* 是否已锁定某台在通联中 */
-    char peer[16];
-    char peer_grid[8];
-    int  peer_rst;          /* 对方报告给我们的 dB */
-    int  my_rst;            /* 我方发出的 dB */
-    int  tx_parity;         /* 我方发射时隙奇偶 */
-    int  attempts;          /* 当前阶段我方已发射次数 */
-    int64_t last_counted;   /* 已计数的我方时隙号 */
-} qso_ctx_t;
-
-/* 最近记录的呼号(完成=永久; 放弃=暂避 SKIP_AGE_SLOTS 个时隙) */
-typedef struct {
-    char call[16];
-    int64_t slot;
-    bool worked;
-} qso_recent_t;
-
-
 /** 自动 QSO 引擎配置(仅 ft8_app_start 启动时生效, 运行中改动也会热生效)。
  *  引擎启用后会"接管" cfg.tx / cfg.tx_enable / cfg.tx_slot_parity,
  *  手动改 cfg.tx 的方式将不再生效(被引擎覆盖)。 */
@@ -180,12 +139,35 @@ typedef struct {
     char target_callsign[16];   /*!< 应答模式定向呼叫对象, 留空=自动选择解码到的 CQ 台 */
 } ft8_qso_config_t;
 
+/* ---- QSO 完成记录(交给日志模块写 ADIF) ---- */
+typedef struct {
+    char     call[16];          /*!< 对方呼号 */
+    char     grid[8];           /*!< 对方网格 */
+    int      rst_sent;          /*!< 我方发给对方的信号报告 dB */
+    int      rst_rcvd;          /*!< 对方发给我们的信号报告 dB */
+    char     band[8];           /*!< 频段, 如 "40m" */
+    float    freq_mhz;          /*!< 频率 MHz, 如 7.074000 */
+    char     station_callsign[16]; /*!< 本机呼号 */
+    char     my_grid[8];        /*!< 本机网格 */
+    bool     have_time;         /*!< 下面的 UTC 日期时间有效(来自 GPS) */
+    uint16_t year_on;  uint8_t month_on,  day_on,  hour_on,  minute_on,  second_on;
+    uint16_t year_off; uint8_t month_off, day_off, hour_off, minute_off, second_off;
+} ft8_qso_record_t;
+
+/** QSO 完成回调(在 ft8 任务上下文调用, 应尽快返回) */
+typedef void (*ft8_qso_callback_t)(const ft8_qso_record_t *rec, void *arg);
+
+/** 注册/注销 QSO 完成回调(传 NULL 注销) */
+void ft8_app_set_qso_callback(ft8_qso_callback_t cb, void *arg);
+
 /** FT8/FT4 应用配置结构体 */
 typedef struct {
     /* ---- 协议与开关 ---- */
     ftx_protocol_t protocol;    /*!< FTX_PROTOCOL_FT8(15s 时隙) / FTX_PROTOCOL_FT4(7.5s) */
     bool tx_enable;             /*!< 是否参与发射(在选中时隙内) */
     bool rx_enable;             /*!< 是否持续接收解码 */
+    bool usb_mount_enable;      /*!< 是否把日志分区作为 U 盘挂载(USB MSC 暴露给 PC);
+                                 *    false=只本地挂载 FAT 写日志, 不启动 USB */
 
     /* ---- 时间(宏观层) ---- */
     bool utc_enable;            /*!< 总开关：按 UTC 对齐 15s/7.5s 栅格；
@@ -205,6 +187,10 @@ typedef struct {
     /* ---- 电台身份 ---- */
     char callsign[16];          /*!< 本机呼号，如 "BG7ABC" */
     char grid[8];               /*!< 本机网格，如 "JO70" */
+
+    /* ---- QSO 日志用(设备无射频信息, 需人工指定) ---- */
+    char  band[8];              /*!< 频段, 如 "40m" */
+    float qso_freq_mhz;         /*!< 频率 MHz, 如 7.074000 */
 
     /* ---- 消息内容(TX 任务每时隙前重新读取；运行中直接改 cfg.tx.* 即可热切换) ---- */
     ft8_app_tx_msg_t tx;

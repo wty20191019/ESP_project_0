@@ -25,6 +25,7 @@ typedef struct {
     uint8_t debounce_cnt;        // 防抖计数
     uint32_t press_start_ms;     // 按下时刻（用于长按检测）
     uint8_t long_press_reported; // 长按事件是否已上报
+    uint32_t last_repeat_ms;     // 上次连发时刻
 } key_state_t;
 
 static key_state_t s_key_states[KEY_NUM_MAX];
@@ -34,7 +35,9 @@ static void *s_user_data = NULL;
 /* 防抖阈值（连续采样次数，每次约 10ms） */
 #define DEBOUNCE_THRESHOLD  3
 /* 长按判定时间（毫秒） */
-#define LONG_PRESS_MS       1000
+#define LONG_PRESS_MS       500
+/* 长按后连续上报间隔（毫秒） */
+#define LONG_REPEAT_MS      120
 
 /* 按键扫描任务 */
 static void key_scan_task(void *arg)
@@ -82,11 +85,22 @@ static void key_scan_task(void *arg)
                 s_key_states[id].debounce_cnt = 0;
             }
 
-            /* ---- 长按检测 ---- */
-            if (s_key_states[id].stable_level == 0 && !s_key_states[id].long_press_reported) {
-                uint32_t hold_ms = (xTaskGetTickCount() * portTICK_PERIOD_MS) - s_key_states[id].press_start_ms;
-                if (hold_ms >= LONG_PRESS_MS) {
-                    s_key_states[id].long_press_reported = 1;
+            /* ---- 长按检测 + 长按连发 ---- */
+            if (s_key_states[id].stable_level == 0) {
+                uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                uint32_t hold_ms = now_ms - s_key_states[id].press_start_ms;
+
+                if (!s_key_states[id].long_press_reported) {
+                    if (hold_ms >= LONG_PRESS_MS) {
+                        s_key_states[id].long_press_reported = 1;
+                        s_key_states[id].last_repeat_ms = now_ms;
+                        if (s_callback) {
+                            s_callback((key_id_t)id, KEY_EVENT_LONG_PRESS, s_user_data);
+                        }
+                    }
+                } else if ((now_ms - s_key_states[id].last_repeat_ms) >= LONG_REPEAT_MS) {
+                    /* 持续按住: 每 LONG_REPEAT_MS 再上报一次, 供调用方连续变化 */
+                    s_key_states[id].last_repeat_ms = now_ms;
                     if (s_callback) {
                         s_callback((key_id_t)id, KEY_EVENT_LONG_PRESS, s_user_data);
                     }
