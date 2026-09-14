@@ -852,10 +852,11 @@ static void gps_time_task(void *arg)
 static void my_key_callback(key_id_t key_id, key_event_t event, void *user_data)
 {
     if (event == KEY_EVENT_LONG_PRESS) {
-        ESP_LOGI("APP", "按键 %d 长按", key_id);
+        /* 方向键长按 = 连续变化(驱动每 ~120ms 重发); SET/RST/MID 长按不处理 */
+        if (key_id == KEY_ID_SET || key_id == KEY_ID_RST || key_id == KEY_ID_MID) return;
+    } else if (event != KEY_EVENT_CLICK) {
         return;
     }
-    if (event != KEY_EVENT_CLICK) return;
 
     int page = s_lcd_page;
 
