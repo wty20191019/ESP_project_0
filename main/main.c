@@ -721,30 +721,30 @@ static const ci_item_t s_ci[] = {
     { "grid",           CI_STR,   cfg.grid,                  0,0,0, sizeof(cfg.grid),     NULL, 0, 0 },
     { "band",           CI_STR,   cfg.band,                  0,0,0, sizeof(cfg.band),     NULL, 0, 0 },
     { "freq_MHz",       CI_FLOAT, &cfg.qso_freq_mhz,       0.1f, 60.0f, 0.001f, 0, NULL, 0, 6 },
-    { "R_protocol",       CI_ENUM,  &cfg.protocol,             0,0,0, 0, s_proto_opts, 2, 0 },
+    { "R_protocol",     CI_ENUM,  &cfg.protocol,             0,0,0, 0, s_proto_opts, 2, 0 },
     { "tx_enable",      CI_BOOL,  &cfg.tx_enable,            0,0,0, 0, NULL, 0, 0 },
-    { "R_rx_enable",      CI_BOOL,  &cfg.rx_enable,            0,0,0, 0, NULL, 0, 0 },
-    { "R_rx_parse_ms",    CI_U32,   &cfg.rx_parse_ms,          0, 5000, 100, 0, NULL, 0, 0 },
+    { "R_rx_enable",    CI_BOOL,  &cfg.rx_enable,            0,0,0, 0, NULL, 0, 0 },
+    { "R_rx_parse_ms",  CI_U32,   &cfg.rx_parse_ms,          0, 5000, 100, 0, NULL, 0, 0 },
     { "tx_delay_ms",    CI_U32,   &cfg.tx_delay_ms,          0, 10000, 50, 0, NULL, 0, 0 },
     { "af_lvl",         CI_FLOAT, &cfg.audio_level,          0, 1, 0.05f, 0, NULL, 0, 2 },
     { "hp_vol",         CI_U8,    &cfg.codec.hp_vol_l,       0, 63, 1, 0, NULL, 0, 0 },
-    { "R_USB_msc",        CI_BOOL,  &cfg.usb_mount_enable,     0,0,0, 0, NULL, 0, 0 },
+    { "R_USB_msc",      CI_BOOL,  &cfg.usb_mount_enable,     0,0,0, 0, NULL, 0, 0 },
     { "utc_en",         CI_BOOL,  &cfg.utc_enable,           0,0,0, 0, NULL, 0, 0 },
     { "gps_utc",        CI_BOOL,  &cfg.gps_utc_enable,       0,0,0, 0, NULL, 0, 0 },
     { "gps_pps",        CI_BOOL,  &cfg.gps_use_pps,          0,0,0, 0, NULL, 0, 0 },
     { "slot_par",       CI_INT,   &cfg.tx_slot_parity,       0, 1, 1, 0, NULL, 0, 0 },
     { "msg_type",       CI_ENUM,  &cfg.tx.type,              0,0,0, 0, s_msg_opts, 7, 0 },
     { "call_to",        CI_STR,   cfg.tx.call_to,            0,0,0, sizeof(cfg.tx.call_to), NULL, 0, 0 },
-    { "cq_mod",         CI_STR,   cfg.tx.cq_modifier,        0,0,0, sizeof(cfg.tx.cq_modifier), NULL, 0, 0 },
+    { "cq_modifier",    CI_STR,   cfg.tx.cq_modifier,        0,0,0, sizeof(cfg.tx.cq_modifier), NULL, 0, 0 },
     { "rst_db",         CI_INT,   &cfg.tx.rst_db,          -30, 30, 1, 0, NULL, 0, 0 },
     { "audio_freq_hz",  CI_FLOAT, &cfg.audio_freq_hz,        50, 3000, 10, 0, NULL, 0, 0 },
-    { "R_rx_f_min",       CI_FLOAT, &cfg.rx_f_min,             0, 3000, 50, 0, NULL, 0, 0 },
-    { "R_rx_f_max",       CI_FLOAT, &cfg.rx_f_max,           100, 5000, 50, 0, NULL, 0, 0 },
+    { "R_rx_f_min",     CI_FLOAT, &cfg.rx_f_min,             0, 3000, 50, 0, NULL, 0, 0 },
+    { "R_rx_f_max",     CI_FLOAT, &cfg.rx_f_max,           100, 5000, 50, 0, NULL, 0, 0 },
     { "max_candidates", CI_INT,   &cfg.max_candidates,       1, 128, 5, 0, NULL, 0, 0 },
     { "ldpc_iterations",CI_INT,   &cfg.ldpc_iterations,      1, 100, 5, 0, NULL, 0, 0 },//
     { "R_rx_time_osr",  CI_INT,   &cfg.rx_time_osr,          1, 4, 1, 0, NULL, 0, 0 },
     { "R_rx_freq_osr",  CI_INT,   &cfg.rx_freq_osr,          1, 4, 1, 0, NULL, 0, 0 },
-    { "R_qso_en",         CI_BOOL,  &cfg.qso.enable,           0,0,0, 0, NULL, 0, 0 },
+    { "R_qso_en",       CI_BOOL,  &cfg.qso.enable,           0,0,0, 0, NULL, 0, 0 },
     { "qso_cq",         CI_BOOL,  &cfg.qso.cq_mode,          0,0,0, 0, NULL, 0, 0 },
     { "qso_rty",        CI_INT,   &cfg.qso.max_retries,      1, 60, 1, 0, NULL, 0, 0 },
     { "qso_to",         CI_STR,   cfg.qso.target_callsign,   0,0,0, sizeof(cfg.qso.target_callsign), NULL, 0, 0 },
@@ -796,22 +796,30 @@ static void ci_edit_step(const ci_item_t *it, int dir)
 
     char v[24];
     int len = ci_value_str(it, v, sizeof(v));
-    if (len <= 0) return;
-    int pos = s_ci_cursor;
-    if (pos < 0) pos = 0;
-    if (pos >= len) pos = len - 1;
-    char c = v[pos];
 
     if (it->type == CI_STR) {
+        /* 允许空串: 空值时按空格起步; 光标在串尾时写入即追加 */
+        int pos = s_ci_cursor;
+        if (pos < 0) pos = 0;
+        if (pos >= it->len - 1) pos = it->len - 2;
+        char c = (len > 0 && pos < len) ? v[pos] : ' ';
         const char *p = strchr(s_ci_charset, c);
         int idx = p ? (int)(p - s_ci_charset) : 0;
         int setn = (int)strlen(s_ci_charset);
         idx = (idx + dir + setn) % setn;
         char *s = (char *)it->ptr;
         s[pos] = s_ci_charset[idx];
-        if (s[pos] && pos + 1 < it->len && s[pos + 1] == '\0') s[pos + 1] = '\0';
+        if (pos >= len) {                       /* 追加: 保证终止 */
+            if (pos + 1 < it->len) s[pos + 1] = '\0';
+        }
         return;
     }
+
+    if (len <= 0) return;
+    int pos = s_ci_cursor;
+    if (pos < 0) pos = 0;
+    if (pos >= len) pos = len - 1;
+    char c = v[pos];
 
     /* 数值: 符号位切换正负 */
     if (c == '-' || c == '+') {
@@ -891,9 +899,16 @@ static void ci_key(key_id_t k)
         int vlen = 1;
         bool numeric = (it->type == CI_INT || it->type == CI_U8 ||
                         it->type == CI_U32 || it->type == CI_FLOAT);
-        if (it->type == CI_STR || numeric) {
+        int maxpos = 0;                 /* 光标最大位置 */
+        if (it->type == CI_STR) {
+            vlen = ci_value_str(it, v, sizeof(v));
+            maxpos = vlen;              /* 字符串可移到末尾后一格(追加) */
+            if (maxpos > it->len - 2) maxpos = it->len - 2;
+            if (maxpos < 0) maxpos = 0;
+        } else if (numeric) {
             vlen = ci_value_str(it, v, sizeof(v));
             if (vlen < 1) vlen = 1;
+            maxpos = vlen - 1;
         }
         switch (k) {
         case KEY_ID_LEFT: {
@@ -904,7 +919,7 @@ static void ci_key(key_id_t k)
         }
         case KEY_ID_RIGHT: {
             int c = s_ci_cursor;
-            do { if (c < vlen - 1) c++; } while (numeric && c < vlen - 1 && v[c] == '.');
+            do { if (c < maxpos) c++; } while (numeric && c < maxpos && v[c] == '.');
             s_ci_cursor = c;
             break;
         }
@@ -913,7 +928,7 @@ static void ci_key(key_id_t k)
         case KEY_ID_MID:   s_ci_edit = false; break;
         default: break;
         }
-        if (s_ci_cursor >= vlen) s_ci_cursor = vlen - 1;
+        if (s_ci_cursor > maxpos) s_ci_cursor = maxpos;
         if (s_ci_cursor < 0) s_ci_cursor = 0;
         if (numeric && s_ci_cursor < vlen && v[s_ci_cursor] == '.') s_ci_cursor = (vlen > 1) ? vlen - 1 : 0;
     }
@@ -952,12 +967,12 @@ static void draw_page_cfg_set(void)
             continue;
         }
 
-        /* 选中行: 手工绘制; 修改状态反色高亮光标位 */
+        /* 选中行: 手工绘制; 修改状态反色高亮光标位(字符串可停在串尾追加) */
         char val[24];
         int vlen = ci_value_str(it, val, sizeof(val));
         int pos = s_ci_cursor;
         if (pos < 0) pos = 0;
-        if (vlen > 0 && pos >= vlen) pos = vlen - 1;
+        if (it->type != CI_STR && vlen > 0 && pos >= vlen) pos = vlen - 1;
         if (vlen == 0) pos = 0;
 
         char head[16];
@@ -972,8 +987,9 @@ static void draw_page_cfg_set(void)
         LCD_ShowString((uint16_t)(hl * 6), (uint16_t)y, (const uint8_t *)val, YELLOW, BLACK, 12, 0);
 
         int cx = hl + pos;
-        if (s_ci_edit && vlen > 0 && cx < 21)
-            LCD_ShowChar((uint16_t)(cx * 6), (uint16_t)y, (uint8_t)val[pos], BLACK, YELLOW, 12, 0);
+        char cch = (pos < vlen) ? val[pos] : ' ';
+        if (s_ci_edit && cx < 21)
+            LCD_ShowChar((uint16_t)(cx * 6), (uint16_t)y, (uint8_t)cch, BLACK, YELLOW, 12, 0);
     }
 }
 
