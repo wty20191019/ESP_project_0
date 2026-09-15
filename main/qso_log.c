@@ -324,6 +324,16 @@ esp_err_t qso_log_init(void)
 
     s_ready = true;
 
+    /* 诊断: 打印主机将看到的逻辑扇区大小(必须为 512, 否则 Windows 可能不创建磁盘) */
+    {
+        uint32_t sec_sz = 0, sec_cnt = 0;
+        tinyusb_msc_get_storage_sector_size(s_msc, &sec_sz);
+        tinyusb_msc_get_storage_capacity(s_msc, &sec_cnt);
+        ESP_LOGI(TAG, "MSC 存储: 逻辑扇区 %u B, 共 %u 个 (%u KB)",
+                 (unsigned)sec_sz, (unsigned)sec_cnt,
+                 (unsigned)((uint64_t)sec_sz * sec_cnt / 1024));
+    }
+
     vTaskDelay(pdMS_TO_TICKS(100));
     FILE *f = fopen(QSO_LOG_PATH, "a");
     if (f) { fclose(f); ESP_LOGI(TAG, "存储就绪: %s", QSO_MOUNT_PATH); }

@@ -321,7 +321,7 @@ idf.py erase-flash
 | `CONFIG_IDF_TARGET` | `esp32s3` | 目标芯片 |
 | `CONFIG_ESPTOOLPY_FLASHSIZE` | `16MB` | Flash 容量 |
 | `CONFIG_SPIRAM` | `y` | 启用 PSRAM（解码快照/波形缓存） |
-| `CONFIG_WL_SECTOR_SIZE` | **`512`** | Wear-Leveling 逻辑扇区大小；IDF 默认是 `4096`，**本工程为 4096**（ |
+| `CONFIG_WL_SECTOR_SIZE` | **`512`** | Wear-Leveling 逻辑扇区大小；IDF 默认是 `4096`，**本工程为 512**|
 | `CONFIG_FATFS_SECTOR_512` | `y` | 与 WL 扇区保持一致（512） |
 | `CONFIG_TINYUSB_MSC_ENABLED` | `y` | 启用 MSC |
 | `CONFIG_TINYUSB_MSC_BUFSIZE` | `4096` | MSC FIFO，**必须 ≥ WL 扇区大小**，否则创建存储会失败 |
