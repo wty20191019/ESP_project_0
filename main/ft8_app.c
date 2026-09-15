@@ -1667,11 +1667,12 @@ esp_err_t ft8_app_start(const ft8_app_config_t *cfg)
         }
     }
 
-    /* 独立解码任务(另一核): 时隙末异步解析快照, 不占用下一时隙采集 */
+    /* 独立解码任务(core1): 时隙末异步解析快照, 与收发核隔离, 不占用采集/发射 */
     if (s_cfg.rx_enable)
-        xTaskCreatePinnedToCore(ft8_dec_task, "ft8_dec", 24576, NULL, 5, &s_dec_task, 0);
+        xTaskCreatePinnedToCore(ft8_dec_task, "ft8_dec", 24576, NULL, 5, &s_dec_task, 1);
 
-    xTaskCreatePinnedToCore(ft8_rx_task, "ft8_rx", STACK_RX, NULL, 6, &s_task_rx, 1);
-    xTaskCreatePinnedToCore(ft8_tx_task, "ft8_tx", STACK_TX, NULL, 6, &s_task_tx, 0);
+    /* 收发同一核(core0): TX 优先级最高(7)保证忙等起播精度, RX 次之(6) */
+    xTaskCreatePinnedToCore(ft8_rx_task, "ft8_rx", STACK_RX, NULL, 6, &s_task_rx, 0);
+    xTaskCreatePinnedToCore(ft8_tx_task, "ft8_tx", STACK_TX, NULL, 7, &s_task_tx, 0);
     return ESP_OK;
 }
