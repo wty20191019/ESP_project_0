@@ -745,7 +745,7 @@ static const ci_item_t s_ci[] = {
     { "R_rx_time_osr",  CI_INT,   &cfg.rx_time_osr,          1, 4, 1, 0, NULL, 0, 0 },
     { "R_rx_freq_osr",  CI_INT,   &cfg.rx_freq_osr,          1, 4, 1, 0, NULL, 0, 0 },
     { "R_qso_en",       CI_BOOL,  &cfg.qso.enable,           0,0,0, 0, NULL, 0, 0 },
-    { "qso_cq",         CI_BOOL,  &cfg.qso.cq_mode,          0,0,0, 0, NULL, 0, 0 },
+    { "cq_mode",        CI_BOOL,  &cfg.qso.cq_mode,          0,0,0, 0, NULL, 0, 0 },
     { "qso_rty",        CI_INT,   &cfg.qso.max_retries,      1, 60, 1, 0, NULL, 0, 0 },
     { "qso_to",         CI_STR,   cfg.qso.target_callsign,   0,0,0, sizeof(cfg.qso.target_callsign), NULL, 0, 0 },
 };
