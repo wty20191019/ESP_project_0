@@ -86,6 +86,7 @@ static tx_wave_key_t s_last_err_key;     /* 最近一次编码失败的快照(�
 /* 运行统计 */
 static uint32_t s_stat_slots = 0;
 static uint32_t s_stat_decoded = 0;
+static volatile uint32_t s_dec_ms = 0;   /* 最近一次解码耗时(ms) */
 
 /* ---------- 协议参数换算 ---------- */
 static bool app_is_ft4(void)             { return s_cfg.protocol == FTX_PROTOCOL_FT4; }
@@ -568,6 +569,11 @@ bool ft8_app_in_tx_slot(void)
     return ((int)(slot & 1)) == (s_cfg.tx_slot_parity & 1);
 }
 
+uint32_t ft8_app_dec_ms(void)
+{
+    return s_dec_ms;
+}
+
 /* ============================================================
  * RX：整窗解析一个时隙(带解码耗时预算，避免拖入下一时隙采集)
  * ============================================================ */
@@ -674,6 +680,8 @@ static void rx_decode_snapshot(const ftx_waterfall_t *wf, int64_t prev_slot, int
     if (budget_cut)
         ESP_LOGW(T, "[RX] 解析预算 %lldms 用尽提前结束，剩余 %d 个候选未处理",
                  (long long)(budget_us / 1000), remaining);
+
+    s_dec_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
 }
 
 /* 丢弃一小段 RX 音频(在接收间隙也持续读取，防止 I2S DMA 积压，
