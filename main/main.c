@@ -733,17 +733,17 @@ static const ci_item_t s_ci[] = {
     { "call_to",  CI_STR,   cfg.tx.call_to,            0,0,0, sizeof(cfg.tx.call_to), NULL, 0, 0 },
     { "cq_mod",   CI_STR,   cfg.tx.cq_modifier,        0,0,0, sizeof(cfg.tx.cq_modifier), NULL, 0, 0 },
     { "rst_db",   CI_INT,   &cfg.tx.rst_db,          -30, 30, 1, 0, NULL, 0, 0 },
-    { "af_Hz",    CI_FLOAT, &cfg.audio_freq_hz,      100, 3000, 10, 0, NULL, 0, 0 },
+    { "af_Hz",    CI_FLOAT, &cfg.audio_freq_hz,        50, 3000, 10, 0, NULL, 0, 0 },
     { "af_lvl",   CI_FLOAT, &cfg.audio_level,          0, 1, 0.05f, 0, NULL, 0, 2 },
     { "hp_vol",   CI_U8,    &cfg.codec.hp_vol_l,       0, 63, 1, 0, NULL, 0, 0 },
     { "rx_fmin",  CI_FLOAT, &cfg.rx_f_min,             0, 3000, 50, 0, NULL, 0, 0 },
     { "rx_fmax",  CI_FLOAT, &cfg.rx_f_max,           100, 5000, 50, 0, NULL, 0, 0 },
-    { "cand",     CI_INT,   &cfg.max_candidates,      10, 140, 5, 0, NULL, 0, 0 },
-    { "ldpc_it",  CI_INT,   &cfg.ldpc_iterations,      5, 100, 5, 0, NULL, 0, 0 },
-    { "parse_ms", CI_U32,   &cfg.rx_parse_ms,       1500, 5000, 100, 0, NULL, 0, 0 },
+    { "cand",     CI_INT,   &cfg.max_candidates,       1, 128, 5, 0, NULL, 0, 0 },
+    { "ldpc_it",  CI_INT,   &cfg.ldpc_iterations,      1, 100, 5, 0, NULL, 0, 0 },//
+    { "parse_ms", CI_U32,   &cfg.rx_parse_ms,          0, 5000, 100, 0, NULL, 0, 0 },
     { "qso_en",   CI_BOOL,  &cfg.qso.enable,           0,0,0, 0, NULL, 0, 0 },
     { "qso_cq",   CI_BOOL,  &cfg.qso.cq_mode,          0,0,0, 0, NULL, 0, 0 },
-    { "qso_rty",  CI_INT,   &cfg.qso.max_retries,      1, 20, 1, 0, NULL, 0, 0 },
+    { "qso_rty",  CI_INT,   &cfg.qso.max_retries,      1, 60, 1, 0, NULL, 0, 0 },
     { "qso_to",   CI_STR,   cfg.qso.target_callsign,   0,0,0, sizeof(cfg.qso.target_callsign), NULL, 0, 0 },
 };
 #define CI_N ((int)(sizeof(s_ci) / sizeof(s_ci[0])))
@@ -1216,7 +1216,7 @@ void app_main(void)
     cfg.rx_f_max            = 3000.0f;                      /* 解码频率上限 */
     cfg.rx_f_min            = 50.0f;                        /* 解码频率下限 */
     cfg.max_candidates      = 50;                           /*每时隙解码耗时 ≈ 候选数(max_candidates) × 每个候选迭代数(ldpc_iterations) × 单次迭代成本*/
-    cfg.ldpc_iterations     = 25;
+    cfg.ldpc_iterations     = 1;
 
     /* WM8978 编解码器参数(对应原硬编码的 ADDA(1,1)/Input(1,1,0)/MIC40/Output(1,0)/I2S(2,0)/HP(50,50)/SPK40，
      * 默认已一致，这里仅示例按需修改) */
