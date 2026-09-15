@@ -407,9 +407,10 @@ void qso_log_on_qso(const ft8_qso_record_t *rec, void *arg)
     p = adif_add(line, p, sizeof(line), "my_gridsquare",    rec->my_grid);
     p = adif_add(line, p, sizeof(line), "comment",          comment);
 
-    /* 预留 <eor>\n 的位置, 保证每条记录一定以换行结束(否则会与下一条粘行) */
+    /* 预留 <eor>\r\n 的位置, 保证每条记录一定以换行结束(否则会与下一条粘行)。
+     * 用 CRLF 而非单 LF, 否则 Windows 记事本等编辑器会显示成一整行。 */
     if (p > (int)sizeof(line) - 7) p = (int)sizeof(line) - 7;
-    p += snprintf(line + p, sizeof(line) - (size_t)p, "<eor>\n");
+    p += snprintf(line + p, sizeof(line) - (size_t)p, "<eor>\r\n");
     line[p] = '\0';
 
     FILE *f = fopen(QSO_LOG_PATH, "a");
