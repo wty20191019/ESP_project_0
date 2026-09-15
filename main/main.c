@@ -19,6 +19,7 @@
 #include "esp_log.h"
 #include "ft8_app.h"
 #include "qso_log.h"
+#include "wm8978.h"
 #include "led.h"
 #include "lcd.h"
 #include "gps.h"
@@ -470,9 +471,10 @@ static void draw_page_main(void)
                  (uint16_t)(MAIN_WF_Y + MAIN_WF_H), RED);
     }
 
-    /* 频率刻度 */
-    lcd_line(MAIN_SCALE_Y, GRAY, 12, "%.3gk-%.3gk",
-             (double)cfg.rx_f_min / 1000.0, (double)cfg.rx_f_max / 1000.0);
+    /* 频率刻度 + 最近一次解码耗时 */
+    lcd_line(MAIN_SCALE_Y, GRAY, 12, "%.3gk-%.3gk D%lums",
+             (double)cfg.rx_f_min / 1000.0, (double)cfg.rx_f_max / 1000.0,
+             (unsigned long)ft8_app_dec_ms());
 
     /* 设置项(小字, 选中反色) */
     int typ = (int)cfg.tx.type;
@@ -699,7 +701,7 @@ static void draw_page_log(void)
 }
 
 /* ================= 页 7: 配置设置(可编辑 cfg 所有主要项) ================= */
-typedef enum { CI_BOOL, CI_INT, CI_U32, CI_FLOAT, CI_STR, CI_ENUM } ci_type_t;
+typedef enum { CI_BOOL, CI_INT, CI_U8, CI_U32, CI_FLOAT, CI_STR, CI_ENUM } ci_type_t;
 
 typedef struct {
     const char *name;
@@ -712,39 +714,43 @@ typedef struct {
     int         dec;                 /* 浮点显示小数位 */
 } ci_item_t;
 
-static const char *const s_proto_opts[] = { "FT8", "FT4" };
+static const char *const s_proto_opts[] = { "FT4", "FT8" };
 
 static const ci_item_t s_ci[] = {
-    { "callsign", CI_STR,   cfg.callsign,              0,0,0, sizeof(cfg.callsign), NULL, 0, 0 },
-    { "grid",     CI_STR,   cfg.grid,                  0,0,0, sizeof(cfg.grid),     NULL, 0, 0 },
-    { "band",     CI_STR,   cfg.band,                  0,0,0, sizeof(cfg.band),     NULL, 0, 0 },
-    { "freq_MHz", CI_FLOAT, &cfg.qso_freq_mhz,       0.1f, 60.0f, 0.001f, 0, NULL, 0, 6 },
-    { "protocol", CI_ENUM,  &cfg.protocol,             0,0,0, 0, s_proto_opts, 2, 0 },
-    { "tx_en",    CI_BOOL,  &cfg.tx_enable,            0,0,0, 0, NULL, 0, 0 },
-    { "rx_en",    CI_BOOL,  &cfg.rx_enable,            0,0,0, 0, NULL, 0, 0 },
-    { "usb_msc",  CI_BOOL,  &cfg.usb_mount_enable,     0,0,0, 0, NULL, 0, 0 },
-    { "utc_en",   CI_BOOL,  &cfg.utc_enable,           0,0,0, 0, NULL, 0, 0 },
-    { "gps_utc",  CI_BOOL,  &cfg.gps_utc_enable,       0,0,0, 0, NULL, 0, 0 },
-    { "gps_pps",  CI_BOOL,  &cfg.gps_use_pps,          0,0,0, 0, NULL, 0, 0 },
-    { "slot_par", CI_INT,   &cfg.tx_slot_parity,       0, 1, 1, 0, NULL, 0, 0 },
-    { "delay_ms", CI_U32,   &cfg.tx_delay_ms,          0, 10000, 50, 0, NULL, 0, 0 },
-    { "msg_type", CI_ENUM,  &cfg.tx.type,              0,0,0, 0, s_msg_opts, 7, 0 },
-    { "call_to",  CI_STR,   cfg.tx.call_to,            0,0,0, sizeof(cfg.tx.call_to), NULL, 0, 0 },
-    { "cq_mod",   CI_STR,   cfg.tx.cq_modifier,        0,0,0, sizeof(cfg.tx.cq_modifier), NULL, 0, 0 },
-    { "rst_db",   CI_INT,   &cfg.tx.rst_db,          -30, 30, 1, 0, NULL, 0, 0 },
-    { "af_Hz",    CI_FLOAT, &cfg.audio_freq_hz,      100, 3000, 10, 0, NULL, 0, 0 },
-    { "af_lvl",   CI_FLOAT, &cfg.audio_level,          0, 1, 0.05f, 0, NULL, 0, 2 },
-    { "rx_fmin",  CI_FLOAT, &cfg.rx_f_min,             0, 3000, 50, 0, NULL, 0, 0 },
-    { "rx_fmax",  CI_FLOAT, &cfg.rx_f_max,           100, 5000, 50, 0, NULL, 0, 0 },
-    { "cand",     CI_INT,   &cfg.max_candidates,      10, 140, 5, 0, NULL, 0, 0 },
-    { "ldpc_it",  CI_INT,   &cfg.ldpc_iterations,      5, 100, 5, 0, NULL, 0, 0 },
-    { "parse_ms", CI_U32,   &cfg.rx_parse_ms,       1500, 5000, 100, 0, NULL, 0, 0 },
-    { "qso_en",   CI_BOOL,  &cfg.qso.enable,           0,0,0, 0, NULL, 0, 0 },
-    { "qso_cq",   CI_BOOL,  &cfg.qso.cq_mode,          0,0,0, 0, NULL, 0, 0 },
-    { "qso_rty",  CI_INT,   &cfg.qso.max_retries,      1, 20, 1, 0, NULL, 0, 0 },
-    { "qso_to",   CI_STR,   cfg.qso.target_callsign,   0,0,0, sizeof(cfg.qso.target_callsign), NULL, 0, 0 },
+    { "callsign",       CI_STR,   cfg.callsign,              0,0,0, sizeof(cfg.callsign), NULL, 0, 0 },
+    { "grid",           CI_STR,   cfg.grid,                  0,0,0, sizeof(cfg.grid),     NULL, 0, 0 },
+    { "band",           CI_STR,   cfg.band,                  0,0,0, sizeof(cfg.band),     NULL, 0, 0 },
+    { "freq_MHz",       CI_FLOAT, &cfg.qso_freq_mhz,       0.1f, 60.0f, 0.001f, 0, NULL, 0, 6 },
+    { "R_protocol",       CI_ENUM,  &cfg.protocol,             0,0,0, 0, s_proto_opts, 2, 0 },
+    { "tx_enable",      CI_BOOL,  &cfg.tx_enable,            0,0,0, 0, NULL, 0, 0 },
+    { "R_rx_enable",      CI_BOOL,  &cfg.rx_enable,            0,0,0, 0, NULL, 0, 0 },
+    { "R_rx_parse_ms",    CI_U32,   &cfg.rx_parse_ms,          0, 5000, 100, 0, NULL, 0, 0 },
+    { "tx_delay_ms",    CI_U32,   &cfg.tx_delay_ms,          0, 10000, 50, 0, NULL, 0, 0 },
+    { "af_lvl",         CI_FLOAT, &cfg.audio_level,          0, 1, 0.05f, 0, NULL, 0, 2 },
+    { "hp_vol",         CI_U8,    &cfg.codec.hp_vol_l,       0, 63, 1, 0, NULL, 0, 0 },
+    { "R_USB_msc",        CI_BOOL,  &cfg.usb_mount_enable,     0,0,0, 0, NULL, 0, 0 },
+    { "utc_en",         CI_BOOL,  &cfg.utc_enable,           0,0,0, 0, NULL, 0, 0 },
+    { "gps_utc",        CI_BOOL,  &cfg.gps_utc_enable,       0,0,0, 0, NULL, 0, 0 },
+    { "gps_pps",        CI_BOOL,  &cfg.gps_use_pps,          0,0,0, 0, NULL, 0, 0 },
+    { "slot_par",       CI_INT,   &cfg.tx_slot_parity,       0, 1, 1, 0, NULL, 0, 0 },
+    { "msg_type",       CI_ENUM,  &cfg.tx.type,              0,0,0, 0, s_msg_opts, 7, 0 },
+    { "call_to",        CI_STR,   cfg.tx.call_to,            0,0,0, sizeof(cfg.tx.call_to), NULL, 0, 0 },
+    { "cq_mod",         CI_STR,   cfg.tx.cq_modifier,        0,0,0, sizeof(cfg.tx.cq_modifier), NULL, 0, 0 },
+    { "rst_db",         CI_INT,   &cfg.tx.rst_db,          -30, 30, 1, 0, NULL, 0, 0 },
+    { "audio_freq_hz",  CI_FLOAT, &cfg.audio_freq_hz,        50, 3000, 10, 0, NULL, 0, 0 },
+    { "R_rx_f_min",       CI_FLOAT, &cfg.rx_f_min,             0, 3000, 50, 0, NULL, 0, 0 },
+    { "R_rx_f_max",       CI_FLOAT, &cfg.rx_f_max,           100, 5000, 50, 0, NULL, 0, 0 },
+    { "max_candidates", CI_INT,   &cfg.max_candidates,       1, 128, 5, 0, NULL, 0, 0 },
+    { "ldpc_iterations",CI_INT,   &cfg.ldpc_iterations,      1, 100, 5, 0, NULL, 0, 0 },//
+    { "R_rx_time_osr",  CI_INT,   &cfg.rx_time_osr,          1, 4, 1, 0, NULL, 0, 0 },
+    { "R_rx_freq_osr",  CI_INT,   &cfg.rx_freq_osr,          1, 4, 1, 0, NULL, 0, 0 },
+    { "R_qso_en",         CI_BOOL,  &cfg.qso.enable,           0,0,0, 0, NULL, 0, 0 },
+    { "qso_cq",         CI_BOOL,  &cfg.qso.cq_mode,          0,0,0, 0, NULL, 0, 0 },
+    { "qso_rty",        CI_INT,   &cfg.qso.max_retries,      1, 60, 1, 0, NULL, 0, 0 },
+    { "qso_to",         CI_STR,   cfg.qso.target_callsign,   0,0,0, sizeof(cfg.qso.target_callsign), NULL, 0, 0 },
 };
 #define CI_N ((int)(sizeof(s_ci) / sizeof(s_ci[0])))
+#define CI_ROWS 12                 /* 小字 12px, 一屏 12 行 */
 
 static int s_ci_sel = 0;
 static int s_ci_scroll = 0;
@@ -761,6 +767,7 @@ static int ci_value_str(const ci_item_t *it, char *out, size_t cap)
     switch (it->type) {
     case CI_BOOL:  snprintf(out, cap, "%s", *(bool *)it->ptr ? "Y" : "N"); break;
     case CI_INT:   snprintf(out, cap, "%d", *(int *)it->ptr); break;
+    case CI_U8:    snprintf(out, cap, "%u", (unsigned)*(uint8_t *)it->ptr); break;
     case CI_U32:   snprintf(out, cap, "%lu", (unsigned long)*(uint32_t *)it->ptr); break;
     case CI_FLOAT: snprintf(out, cap, "%.*f", it->dec, (double)*(float *)it->ptr); break;
     case CI_STR:   snprintf(out, cap, "%s", (char *)it->ptr); break;
@@ -823,26 +830,36 @@ static void ci_edit_step(const ci_item_t *it, int dir)
     }
     if (c < '0' || c > '9') return;
 
-    /* 计算光标所在位的权值: 整数位=10^n, 小数位=10^-n */
-    bool frac = false;
-    for (int i = 0; i < pos; i++) if (v[i] == '.') { frac = true; break; }
-    int cnt = 0;
-    if (!frac) {
-        for (int i = pos + 1; i < len; i++) {
-            if (v[i] == '.') break;
+    /* 计算光标所在位的权值: 整数位=10^n, 小数位=10^-(距小数点位数); 小数点不参与 */
+    int dot = -1;
+    for (int i = 0; i < len; i++) if (v[i] == '.') { dot = i; break; }
+    if (dot >= 0 && pos == dot) return;
+
+    double place;
+    if (dot < 0 || pos < dot) {
+        int end = (dot < 0) ? len : dot;
+        int cnt = 0;
+        for (int i = pos + 1; i < end; i++)
             if (v[i] >= '0' && v[i] <= '9') cnt++;
-        }
+        place = pow(10.0, cnt);
     } else {
-        for (int i = pos; i < len; i++)
-            if (v[i] >= '0' && v[i] <= '9') cnt++;
+        place = pow(10.0, -(double)(pos - dot));
     }
-    double place = pow(10.0, frac ? -cnt : cnt);
 
     if (it->type == CI_INT) {
         long x = (long)*(int *)it->ptr + (long)(dir * place);
         if (x < (long)it->vmin) x = (long)it->vmin;
         if (x > (long)it->vmax) x = (long)it->vmax;
         *(int *)it->ptr = (int)x;
+    } else if (it->type == CI_U8) {
+        long x = (long)*(uint8_t *)it->ptr + (long)(dir * place);
+        if (x < (long)it->vmin) x = (long)it->vmin;
+        if (x > (long)it->vmax) x = (long)it->vmax;
+        *(uint8_t *)it->ptr = (uint8_t)x;
+        if (it->ptr == (void *)&cfg.codec.hp_vol_l) {   /* hp_vol 同步左右声道并立即生效 */
+            cfg.codec.hp_vol_r = (uint8_t)x;
+            WM8978_HPvol_Set(cfg.codec.hp_vol_l, cfg.codec.hp_vol_r);
+        }
     } else if (it->type == CI_U32) {
         long x = (long)*(uint32_t *)it->ptr + (long)(dir * place);
         if (x < (long)it->vmin) x = (long)it->vmin;
@@ -869,17 +886,28 @@ static void ci_key(key_id_t k)
         default: break;
         }
     } else {
-        /* 修改状态: 左右选修改位, 上下按该位权值加减/换字符, 中键退出 */
+        /* 修改状态: 左右选修改位(数值跳过小数点), 上下按该位权值加减/换字符, 中键退出 */
+        char v[24];
         int vlen = 1;
-        if (it->type == CI_STR || it->type == CI_INT ||
-            it->type == CI_U32 || it->type == CI_FLOAT) {
-            char v[24];
+        bool numeric = (it->type == CI_INT || it->type == CI_U8 ||
+                        it->type == CI_U32 || it->type == CI_FLOAT);
+        if (it->type == CI_STR || numeric) {
             vlen = ci_value_str(it, v, sizeof(v));
             if (vlen < 1) vlen = 1;
         }
         switch (k) {
-        case KEY_ID_LEFT:  if (s_ci_cursor > 0) s_ci_cursor--; break;
-        case KEY_ID_RIGHT: if (s_ci_cursor < vlen - 1) s_ci_cursor++; break;
+        case KEY_ID_LEFT: {
+            int c = s_ci_cursor;
+            do { if (c > 0) c--; } while (numeric && c > 0 && v[c] == '.');
+            s_ci_cursor = c;
+            break;
+        }
+        case KEY_ID_RIGHT: {
+            int c = s_ci_cursor;
+            do { if (c < vlen - 1) c++; } while (numeric && c < vlen - 1 && v[c] == '.');
+            s_ci_cursor = c;
+            break;
+        }
         case KEY_ID_UP:    ci_edit_step(it, +1); break;
         case KEY_ID_DOWN:  ci_edit_step(it, -1); break;
         case KEY_ID_MID:   s_ci_edit = false; break;
@@ -887,33 +915,36 @@ static void ci_key(key_id_t k)
         }
         if (s_ci_cursor >= vlen) s_ci_cursor = vlen - 1;
         if (s_ci_cursor < 0) s_ci_cursor = 0;
+        if (numeric && s_ci_cursor < vlen && v[s_ci_cursor] == '.') s_ci_cursor = (vlen > 1) ? vlen - 1 : 0;
     }
 
     if (s_ci_sel < s_ci_scroll) s_ci_scroll = s_ci_sel;
-    if (s_ci_sel >= s_ci_scroll + 9) s_ci_scroll = s_ci_sel - 8;
+    if (s_ci_sel >= s_ci_scroll + CI_ROWS) s_ci_scroll = s_ci_sel - (CI_ROWS - 1);
     s_cfg_dirty = true;
 }
 
 static void draw_page_cfg_set(void)
 {
-    lcd_row(0, CYAN, "CFG SET %d/%d%s", s_ci_sel + 1, CI_N, s_ci_edit ? " EDIT" : "");
+    lcd_line(0, CYAN, 12, "CFG SET %d/%d%s", s_ci_sel + 1, CI_N, s_ci_edit ? " EDIT" : "");
 
-    for (int r = 0; r < 9; r++) {
+    for (int r = 0; r < CI_ROWS; r++) {
         int i = s_ci_scroll + r;
         if (i >= CI_N) break;
         const ci_item_t *it = &s_ci[i];
+        int y = 12 + r * 12;
 
         if (i != s_ci_sel) {
             switch (it->type) {
-            case CI_BOOL:  lcd_row(1 + r, WHITE, " %s %s", it->name, *(bool *)it->ptr ? "Y" : "N"); break;
-            case CI_INT:   lcd_row(1 + r, WHITE, " %s %d", it->name, *(int *)it->ptr); break;
-            case CI_U32:   lcd_row(1 + r, WHITE, " %s %lu", it->name, (unsigned long)*(uint32_t *)it->ptr); break;
-            case CI_FLOAT: lcd_row(1 + r, WHITE, " %s %.*f", it->name, it->dec, (double)*(float *)it->ptr); break;
-            case CI_STR:   lcd_row(1 + r, WHITE, " %s %s", it->name, (char *)it->ptr); break;
+            case CI_BOOL:  lcd_line(y, WHITE, 12, " %s %s", it->name, *(bool *)it->ptr ? "Y" : "N"); break;
+            case CI_INT:   lcd_line(y, WHITE, 12, " %s %d", it->name, *(int *)it->ptr); break;
+            case CI_U8:    lcd_line(y, WHITE, 12, " %s %u", it->name, (unsigned)*(uint8_t *)it->ptr); break;
+            case CI_U32:   lcd_line(y, WHITE, 12, " %s %lu", it->name, (unsigned long)*(uint32_t *)it->ptr); break;
+            case CI_FLOAT: lcd_line(y, WHITE, 12, " %s %.*f", it->name, it->dec, (double)*(float *)it->ptr); break;
+            case CI_STR:   lcd_line(y, WHITE, 12, " %s %s", it->name, (char *)it->ptr); break;
             case CI_ENUM: {
                 int v = *(int *)it->ptr;
                 if (v < 0 || v >= it->nopts) v = 0;
-                lcd_row(1 + r, WHITE, " %s %s", it->name, it->opts[v]);
+                lcd_line(y, WHITE, 12, " %s %s", it->name, it->opts[v]);
                 break;
             }
             default: break;
@@ -936,14 +967,13 @@ static void draw_page_cfg_set(void)
         head[hl++] = ' ';
         head[hl] = '\0';
 
-        int y = 16 * (1 + r);
-        LCD_Fill(0, (uint16_t)y, LCD_W, (uint16_t)(y + 16), BLACK);
-        LCD_ShowString(0, (uint16_t)y, (const uint8_t *)head, YELLOW, BLACK, 16, 0);
-        LCD_ShowString((uint16_t)(hl * 8), (uint16_t)y, (const uint8_t *)val, YELLOW, BLACK, 16, 0);
+        LCD_Fill(0, (uint16_t)y, LCD_W, (uint16_t)(y + 12), BLACK);
+        LCD_ShowString(0, (uint16_t)y, (const uint8_t *)head, YELLOW, BLACK, 12, 0);
+        LCD_ShowString((uint16_t)(hl * 6), (uint16_t)y, (const uint8_t *)val, YELLOW, BLACK, 12, 0);
 
         int cx = hl + pos;
-        if (s_ci_edit && vlen > 0 && cx < 16)
-            LCD_ShowChar((uint16_t)(cx * 8), (uint16_t)y, (uint8_t)val[pos], BLACK, YELLOW, 16, 0);
+        if (s_ci_edit && vlen > 0 && cx < 21)
+            LCD_ShowChar((uint16_t)(cx * 6), (uint16_t)y, (uint8_t)val[pos], BLACK, YELLOW, 12, 0);
     }
 }
 
@@ -991,7 +1021,7 @@ static void LCD_task(void *arg)
 }
 
 /* ================= RGB LED 呼吸灯 ================= */
-static void rgb_led_task(void *arg)
+static void rgb_led_task_0(void *arg)
 {
     static uint8_t res = 0;
     if (res == 0)
@@ -1012,6 +1042,32 @@ static void rgb_led_task(void *arg)
         /* 蓝色呼吸 */
         for (int i = 0; i <= 255; i += 5) { led_set_rgb(0, 0, i); vTaskDelay(pdMS_TO_TICKS(5)); }
         for (int i = 255; i > 0; i -= 5)  { led_set_rgb(0, 0, i); vTaskDelay(pdMS_TO_TICKS(5)); }
+    }
+}
+
+
+
+
+/* ================= RGB LED 状态灯 ================= */
+static void rgb_led_task(void *arg)
+{
+    static uint8_t res = 0;
+    if (res == 0)
+    {
+        led_init();
+        ESP_LOGI(TAG, "RGB LED 状态灯任务启动");
+        res = 1;
+    }
+
+    bool on = false;
+    for (;;)
+    {
+        /* 发射时隙=红, 接收时隙=绿; 每 20ms 翻转闪动 */
+        bool tx_slot = ft8_app_in_tx_slot();
+        if (on) led_set_rgb(tx_slot ? 64 : 0, tx_slot ? 0 : 64, 0);
+        else    led_set_rgb(0, 0, 0);
+        on = !on;
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
@@ -1162,8 +1218,10 @@ void app_main(void)
     cfg.audio_level         = 0.80f;                        /* 发射电平 */ /*!< 发射幅度 0~1，防削波建议 ≤0.9 */
     cfg.rx_f_max            = 3000.0f;                      /* 解码频率上限 */
     cfg.rx_f_min            = 50.0f;                        /* 解码频率下限 */
-    cfg.max_candidates      = 50;                           /*每时隙解码耗时 ≈ 候选数(max_candidates) × 每个候选迭代数(ldpc_iterations) × 单次迭代成本*/
-    cfg.ldpc_iterations     = 25;
+    cfg.max_candidates      = 30;                           /*每时隙解码耗时 ≈ 候选数(max_candidates) × 每个候选迭代数(ldpc_iterations) × 单次迭代成本*/
+    cfg.ldpc_iterations     = 1;
+    cfg.rx_time_osr         = 2;                            // 采样率倍数(1=8kHz, 2=16kHz, 4=32kHz, 8=64kHz)
+    cfg.rx_freq_osr         = 2;                            // 采样率倍数(1=8kHz, 2=16kHz, 4=32kHz, 8=64kHz)
 
     /* WM8978 编解码器参数(对应原硬编码的 ADDA(1,1)/Input(1,1,0)/MIC40/Output(1,0)/I2S(2,0)/HP(50,50)/SPK40，
      * 默认已一致，这里仅示例按需修改) */

@@ -75,6 +75,12 @@ void ft8_rx_log_clear(void);
 /** 当前是否正在发射(供状态栏显示 TX/RX) */
 bool ft8_app_tx_busy(void);
 
+/** 当前是否处于"本台发射时隙"(按奇偶与 UTC/本地栅格判断) */
+bool ft8_app_in_tx_slot(void);
+
+/** 最近一次解码耗时(毫秒, 供界面显示) */
+uint32_t ft8_app_dec_ms(void);
+
 /**
  * 发射消息类型：标准一次通联的 6 类内容。
  * 文本一律以本机(呼号=callsign)为发送方视角拼接，格式为：

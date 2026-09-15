@@ -86,6 +86,7 @@ static tx_wave_key_t s_last_err_key;     /* 最近一次编码失败的快照(�
 /* 运行统计 */
 static uint32_t s_stat_slots = 0;
 static uint32_t s_stat_decoded = 0;
+static volatile uint32_t s_dec_ms = 0;   /* 最近一次解码耗时(ms) */
 
 /* ---------- 协议参数换算 ---------- */
 static bool app_is_ft4(void)             { return s_cfg.protocol == FTX_PROTOCOL_FT4; }
@@ -557,10 +558,26 @@ bool ft8_app_tx_busy(void)
     return s_tx_busy;
 }
 
+bool ft8_app_in_tx_slot(void)
+{
+    if (s_cfg_p == NULL) return false;
+    utc_try_lock_gps();
+    utc_ref_t ref;
+    utc_ref_get(&ref);
+    int64_t now = esp_timer_get_time();
+    int64_t slot = utc_to_us(&ref, now) / app_slot_us();
+    return ((int)(slot & 1)) == (s_cfg.tx_slot_parity & 1);
+}
+
+uint32_t ft8_app_dec_ms(void)
+{
+    return s_dec_ms;
+}
+
 /* ============================================================
  * RX：整窗解析一个时隙(带解码耗时预算，避免拖入下一时隙采集)
  * ============================================================ */
-static void rx_decode_slot(monitor_t *mon, int64_t prev_slot, int64_t budget_us)
+static void rx_decode_snapshot(const ftx_waterfall_t *wf, int64_t prev_slot, int64_t budget_us)
 {
     const char *T = "ft8_app";
     const bool ft4 = app_is_ft4();
@@ -572,7 +589,7 @@ static void rx_decode_slot(monitor_t *mon, int64_t prev_slot, int64_t budget_us)
     s_stat_slots++;
     const char *who = ((prev_slot & 1) == (s_cfg.tx_slot_parity & 1)) ? "本台发射时隙" : "对端接收时隙";
     ESP_LOGI(T, "[RX] 解析时隙 #%lld(%s) 结束，瀑布 %d/%d 块",
-             (long long)prev_slot, who, mon->wf.num_blocks, mon->wf.max_blocks);
+             (long long)prev_slot, who, wf->num_blocks, wf->max_blocks);
 
     /* 去重缓存：容量跟随 cfg.max_candidates(上限 140，与候选数组一致)。
      * 放在函数内每次调用都是全新的 —— 即“每个时隙解析完自动作废/清空”，
@@ -585,11 +602,11 @@ static void rx_decode_slot(monitor_t *mon, int64_t prev_slot, int64_t budget_us)
 
     const float sym_period = ft4 ? FT4_SYMBOL_PERIOD : FT8_SYMBOL_PERIOD;
     const float bin_hz = 1.0f / sym_period;
-    const int f_osr = (mon->wf.freq_osr > 0) ? mon->wf.freq_osr : 1;
-    const int t_osr = (mon->wf.time_osr > 0) ? mon->wf.time_osr : 1;
+    const int f_osr = (wf->freq_osr > 0) ? wf->freq_osr : 1;
+    const int t_osr = (wf->time_osr > 0) ? wf->time_osr : 1;
 
     static ftx_candidate_t cands[140];
-    int n = ftx_find_candidates(&mon->wf,
+    int n = ftx_find_candidates(wf,
                                 s_cfg.max_candidates > 0 ? s_cfg.max_candidates : 140,
                                 cands, 10);
     bool budget_cut = false;
@@ -602,7 +619,7 @@ static void rx_decode_slot(monitor_t *mon, int64_t prev_slot, int64_t budget_us)
         }
         ftx_message_t msg;
         ftx_decode_status_t st;
-        if (!ftx_decode_candidate(&mon->wf, &cands[i],
+        if (!ftx_decode_candidate(wf, &cands[i],
                                   s_cfg.ldpc_iterations > 0 ? s_cfg.ldpc_iterations : 25,
                                   &msg, &st)) {
             continue;
@@ -632,7 +649,7 @@ static void rx_decode_slot(monitor_t *mon, int64_t prev_slot, int64_t budget_us)
         uint8_t tones[FT4_NN];
         if (ft4) ft4_encode(msg.payload, tones);
         else     ft8_encode(msg.payload, tones);
-        float snr_db = rx_measure_snr(&mon->wf, &cands[i], tones,
+        float snr_db = rx_measure_snr(wf, &cands[i], tones,
                                       ft4 ? FT4_NN : FT8_NN, ft4 ? 4 : 8, bin_hz);
         char snr_str[16];
         if (isfinite(snr_db)) snprintf(snr_str, sizeof(snr_str), "%+.0fdB", snr_db);
@@ -663,7 +680,8 @@ static void rx_decode_slot(monitor_t *mon, int64_t prev_slot, int64_t budget_us)
     if (budget_cut)
         ESP_LOGW(T, "[RX] 解析预算 %lldms 用尽提前结束，剩余 %d 个候选未处理",
                  (long long)(budget_us / 1000), remaining);
-    monitor_reset(mon);
+
+    s_dec_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
 }
 
 /* 丢弃一小段 RX 音频(在接收间隙也持续读取，防止 I2S DMA 积压，
@@ -769,6 +787,55 @@ const ft8_wf_snap_t *ft8_wf_snap(void)
     return s_wf;
 }
 
+/* ============================================================
+ * 解码快照 + 独立解码任务
+ *   时隙末把瀑布拷到 PSRAM, 唤醒解码任务(另一核)异步解码;
+ *   RX 任务立即清空瀑布、继续下一时隙采集 —— 解码不再占用下一时隙。
+ * ============================================================ */
+static uint8_t  *s_dec_mag = NULL;
+static size_t    s_dec_mag_cap = 0;
+static ftx_waterfall_t s_dec_wf;
+static int64_t   s_dec_slot = 0;
+static volatile bool s_dec_busy = false;
+static TaskHandle_t  s_dec_task = NULL;
+
+static void ft8_dec_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        rx_decode_snapshot(&s_dec_wf, s_dec_slot, 10000000);  /* 上限 10s, 不阻塞采集 */
+        s_dec_busy = false;
+    }
+}
+
+/* 时隙末调用: 拷贝瀑布并唤醒解码任务; 若上次解码未完成则跳过本时隙 */
+static void rx_handoff_slot(monitor_t *mon, int64_t slot)
+{
+    if (!s_cfg.rx_enable) return;
+
+    if (s_dec_mag == NULL) {                 /* 无快照内存: 退回同步解码 */
+        rx_decode_snapshot(&mon->wf, slot, 2000000);
+        monitor_reset(mon);
+        return;
+    }
+    if (s_dec_busy) {
+        ESP_LOGW("ft8_app", "[RX] 解码任务忙, 跳过时隙 #%lld", (long long)slot);
+        monitor_reset(mon);
+        return;
+    }
+
+    size_t bytes = (size_t)mon->wf.num_blocks * (size_t)mon->wf.block_stride;
+    if (bytes > s_dec_mag_cap) bytes = s_dec_mag_cap;
+    s_dec_wf = mon->wf;
+    s_dec_wf.mag = (WF_ELEM_T *)s_dec_mag;
+    memcpy(s_dec_mag, mon->wf.mag, bytes);
+    s_dec_slot = slot;
+    s_dec_busy = true;
+    xTaskNotifyGive(s_dec_task);
+    monitor_reset(mon);                      /* 立即清空, 下一时隙从头采集 */
+}
+
 static void ft8_rx_task(void *arg)
 {
     (void)arg;
@@ -776,7 +843,6 @@ static void ft8_rx_task(void *arg)
     const bool ft4 = app_is_ft4();
     const int sym_samples = app_sym_samples();
     const int64_t slot_us = app_slot_us();
-    const int64_t block_us = (int64_t)sym_samples * 1000000LL / FT8_AUDIO_RATE;
 
     static int16_t ablk[MAX_SYMBOL_SAMPLES * 2];
     static float   fr[MAX_SYMBOL_SAMPLES];
@@ -794,30 +860,32 @@ static void ft8_rx_task(void *arg)
         monitor_init(&mon, &mc);
         ESP_LOGI(T, "%s 解码启动: %d bins x %d blocks",
                  ft4 ? "FT4" : "FT8", mon.wf.num_bins, mon.wf.max_blocks);
+
+        /* 解码快照缓冲: 放 PSRAM(优先), 失败退内部 RAM; 再失败则退回同步解码 */
+        size_t cap = (size_t)mon.wf.max_blocks * (size_t)mon.wf.block_stride;
+        s_dec_mag = heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (s_dec_mag == NULL) s_dec_mag = malloc(cap);
+        s_dec_mag_cap = (s_dec_mag != NULL) ? cap : 0;
+        ESP_LOGI(T, "解码快照缓冲: %u KB (%s)", (unsigned)(cap / 1024),
+                 s_dec_mag ? "OK" : "失败, 退回同步解码");
     }
 
     /* 时隙节奏：
      *  - 每个时隙从“时隙起点”开始接收(喂瀑布)；
-     *  - 到“时隙结束前 parse_us”即停止接收，在末尾静默段解析本时隙，
-     *    解析不占用下一时隙开头的采集窗口，窗口起点永远紧贴时隙边界。
-     *  - parse_us 有下限(1.5s)，防止配置过小导致解码拖入下一时隙、
-     *    进而整槽跳过(表现为“本台发射时隙 RX=0”)。 */
+     *  - 到“时隙结束前 parse_us”停止接收，把瀑布快照交给解码任务异步解析，
+     *    RX 任务随即回到下一时隙起点继续采集 —— 解码不再占用下一时隙。
+     *  - parse_us 只需留出拷贝/切换时间(下限 300ms)。 */
     const int64_t msg_us = (int64_t)app_nsym() * sym_samples * 1000000LL / FT8_AUDIO_RATE;
     const int64_t margin_us = 300000;                  /* 对端起播/本机发射延时容差 */
-    int64_t parse_us = (int64_t)(s_cfg.rx_parse_ms > 0 ? s_cfg.rx_parse_ms : 1500) * 1000;
-    if (parse_us < 1500000) parse_us = 1500000;        /* 解析期下限，保证每时隙都能按时解完 */
+    int64_t parse_us = (int64_t)(s_cfg.rx_parse_ms > 0 ? s_cfg.rx_parse_ms : 300) * 1000;
+    if (parse_us < 300000) parse_us = 300000;
     const int64_t max_parse_us = slot_us - (msg_us + margin_us);
     if (parse_us > max_parse_us) parse_us = max_parse_us;   /* 不能挤占消息本身 */
     const int64_t cap_us = slot_us - parse_us;         /* 每时隙采集时长 */
 
-    /* 解析预算：预留期再扣掉一个读块+余量，确保解码最晚在时隙边界前结束，
-     * 下一时隙(含本台发射时隙)的接收不会被拖慢/跳过 */
-    const int64_t guard_us = 300000;
-    int64_t budget_us = parse_us - block_us - guard_us;
-    if (budget_us < 100000) budget_us = 100000;
-    ESP_LOGI(T, "%s RX 节奏: 前%.2fs接收, 末尾预留%.2fs解析(预算%.2fs)",
+    ESP_LOGI(T, "%s RX 节奏: 前%.2fs接收, 末尾预留%.2fs交接(解码在独立任务)",
              ft4 ? "FT4" : "FT8",
-             (double)cap_us / 1e6, (double)parse_us / 1e6, (double)budget_us / 1e6);
+             (double)cap_us / 1e6, (double)parse_us / 1e6);
 
     for (;;) {
         /* 尝试用 GPS UTC+PPS 锁存 UTC 相位(仅在启用且 GPS 就绪后锁一次) */
@@ -862,9 +930,9 @@ static void ft8_rx_task(void *arg)
             rx_status_log(&mon, now, slot_id);
         }
 
-        /* 停止接收：在时隙末尾静默段解析本时隙(之后自动等到下一时隙起点) */
+        /* 停止接收：把本时隙瀑布快照交给解码任务, 立即准备下一时隙 */
         rx_status_log(&mon, esp_timer_get_time(), slot_id);
-        if (s_cfg.rx_enable) rx_decode_slot(&mon, slot_id, budget_us);
+        if (s_cfg.rx_enable) rx_handoff_slot(&mon, slot_id);
 
         int64_t after = esp_timer_get_time();
         int64_t next_b = utc_from_us(&ref, (slot_id + 1) * slot_us);
@@ -1009,7 +1077,7 @@ static void ft8_tx_task(void *arg)
  * 自动 QSO 引擎(一个真正的 FT8/FT4 通联状态机)
  *
  * 数据流:
- *   RX 任务在 rx_decode_slot 把每条解码成功的消息结构化成 qso_rx_t
+ *   RX 任务在 rx_decode_snapshot(独立解码任务) 把每条解码成功的消息结构化成 qso_rx_t
  *   (标准消息三字段 call_to/call_de/extra + 字段类型 + 频率/SNR/时隙),
  *   经 s_qso_q 队列投递到本引擎任务。
  *   引擎按"发射方视角"识别消息语义并驱动状态机, 通过改写 cfg.tx /
@@ -1542,10 +1610,10 @@ void ft8_app_config_default(ft8_app_config_t *cfg)
     cfg->audio_level      = 0.45f;
     cfg->rx_f_min         = 0.0f;
     cfg->rx_f_max         = 4000.0f;
-    cfg->rx_time_osr      = 2;
-    cfg->rx_freq_osr      = 2;
-    cfg->max_candidates   = 60;  /*每时隙解码耗时 ≈ 候选数(max_candidates) × 每个候选迭代数(ldpc_iterations) × 单次迭代成本*/
-    cfg->ldpc_iterations  = 25;
+    cfg->rx_time_osr      = 1;
+    cfg->rx_freq_osr      = 1;
+    cfg->max_candidates   = 50;  /*每时隙解码耗时 ≈ 候选数(max_candidates) × 每个候选迭代数(ldpc_iterations) × 单次迭代成本*/
+    cfg->ldpc_iterations  = 1;
 
     /* 自动 QSO 引擎默认: 关闭(保持原有手动 cfg.tx 行为), 主叫模式 */
     cfg->qso.enable           = false;      // 启用自动 QSO 引擎(启用才建队, RX 解码无队时不产生额外开销)
@@ -1607,7 +1675,12 @@ esp_err_t ft8_app_start(const ft8_app_config_t *cfg)
         }
     }
 
-    xTaskCreatePinnedToCore(ft8_rx_task, "ft8_rx", STACK_RX, NULL, 6, &s_task_rx, 1);
-    xTaskCreatePinnedToCore(ft8_tx_task, "ft8_tx", STACK_TX, NULL, 6, &s_task_tx, 0);
+    /* 独立解码任务(core1): 时隙末异步解析快照, 与收发核隔离, 不占用采集/发射 */
+    if (s_cfg.rx_enable)
+        xTaskCreatePinnedToCore(ft8_dec_task, "ft8_dec", 24576, NULL, 5, &s_dec_task, 1);
+
+    /* 收发同一核(core0): TX 优先级最高(7)保证忙等起播精度, RX 次之(6) */
+    xTaskCreatePinnedToCore(ft8_rx_task, "ft8_rx", STACK_RX, NULL, 6, &s_task_rx, 0);
+    xTaskCreatePinnedToCore(ft8_tx_task, "ft8_tx", STACK_TX, NULL, 7, &s_task_tx, 0);
     return ESP_OK;
 }
