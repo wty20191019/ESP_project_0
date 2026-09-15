@@ -462,16 +462,8 @@ esp_err_t cfg_store_load(ft8_app_config_t *cfg)
             cfg->tx_delay_ms = (uint32_t)strtoul(v, NULL, 10);
         } else if (!strcmp(k, "audio_level")) {
             cfg->audio_level = (float)atof(v);
-        } else if (!strcmp(k, "max_candidates")) {
-            cfg->max_candidates = atoi(v);
-        } else if (!strcmp(k, "ldpc_iterations")) {
-            cfg->ldpc_iterations = atoi(v);
         } else if (!strcmp(k, "rx_parse_ms")) {
             cfg->rx_parse_ms = (uint32_t)strtoul(v, NULL, 10);
-        } else if (!strcmp(k, "rx_time_osr")) {
-            cfg->rx_time_osr = atoi(v);
-        } else if (!strcmp(k, "rx_freq_osr")) {
-            cfg->rx_freq_osr = atoi(v);
         }
     }
     fclose(f);
@@ -504,11 +496,7 @@ esp_err_t cfg_store_save(const ft8_app_config_t *cfg)
     fprintf(f, "tx_slot_parity=%d\n",  cfg->tx_slot_parity);
     fprintf(f, "tx_delay_ms=%lu\n",    (unsigned long)cfg->tx_delay_ms);
     fprintf(f, "audio_level=%.2f\n",   (double)cfg->audio_level);
-    fprintf(f, "max_candidates=%d\n",  cfg->max_candidates);
-    fprintf(f, "ldpc_iterations=%d\n", cfg->ldpc_iterations);
     fprintf(f, "rx_parse_ms=%lu\n",    (unsigned long)cfg->rx_parse_ms);
-    fprintf(f, "rx_time_osr=%d\n",     cfg->rx_time_osr);
-    fprintf(f, "rx_freq_osr=%d\n",     cfg->rx_freq_osr);
     fclose(f);
     return ESP_OK;
 }

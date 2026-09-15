@@ -1553,10 +1553,10 @@ void ft8_app_config_default(ft8_app_config_t *cfg)
     cfg->audio_level      = 0.45f;
     cfg->rx_f_min         = 0.0f;
     cfg->rx_f_max         = 4000.0f;
-    cfg->rx_time_osr      = 2;
-    cfg->rx_freq_osr      = 2;
-    cfg->max_candidates   = 60;  /*每时隙解码耗时 ≈ 候选数(max_candidates) × 每个候选迭代数(ldpc_iterations) × 单次迭代成本*/
-    cfg->ldpc_iterations  = 25;
+    cfg->rx_time_osr      = 1;
+    cfg->rx_freq_osr      = 1;
+    cfg->max_candidates   = 50;  /*每时隙解码耗时 ≈ 候选数(max_candidates) × 每个候选迭代数(ldpc_iterations) × 单次迭代成本*/
+    cfg->ldpc_iterations  = 1;
 
     /* 自动 QSO 引擎默认: 关闭(保持原有手动 cfg.tx 行为), 主叫模式 */
     cfg->qso.enable           = false;      // 启用自动 QSO 引擎(启用才建队, RX 解码无队时不产生额外开销)

@@ -1215,8 +1215,10 @@ void app_main(void)
     cfg.audio_level         = 0.80f;                        /* 发射电平 */ /*!< 发射幅度 0~1，防削波建议 ≤0.9 */
     cfg.rx_f_max            = 3000.0f;                      /* 解码频率上限 */
     cfg.rx_f_min            = 50.0f;                        /* 解码频率下限 */
-    cfg.max_candidates      = 50;                           /*每时隙解码耗时 ≈ 候选数(max_candidates) × 每个候选迭代数(ldpc_iterations) × 单次迭代成本*/
+    cfg.max_candidates      = 30;                           /*每时隙解码耗时 ≈ 候选数(max_candidates) × 每个候选迭代数(ldpc_iterations) × 单次迭代成本*/
     cfg.ldpc_iterations     = 1;
+    cfg.rx_time_osr         = 2;                            // 采样率倍数(1=8kHz, 2=16kHz, 4=32kHz, 8=64kHz)
+    cfg.rx_freq_osr         = 2;                            // 采样率倍数(1=8kHz, 2=16kHz, 4=32kHz, 8=64kHz)
 
     /* WM8978 编解码器参数(对应原硬编码的 ADDA(1,1)/Input(1,1,0)/MIC40/Output(1,0)/I2S(2,0)/HP(50,50)/SPK40，
      * 默认已一致，这里仅示例按需修改) */
