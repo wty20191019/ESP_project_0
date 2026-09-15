@@ -471,9 +471,10 @@ static void draw_page_main(void)
                  (uint16_t)(MAIN_WF_Y + MAIN_WF_H), RED);
     }
 
-    /* 频率刻度 */
-    lcd_line(MAIN_SCALE_Y, GRAY, 12, "%.3gk-%.3gk",
-             (double)cfg.rx_f_min / 1000.0, (double)cfg.rx_f_max / 1000.0);
+    /* 频率刻度 + 最近一次解码耗时 */
+    lcd_line(MAIN_SCALE_Y, GRAY, 12, "%.3gk-%.3gk D%lums",
+             (double)cfg.rx_f_min / 1000.0, (double)cfg.rx_f_max / 1000.0,
+             (unsigned long)ft8_app_dec_ms());
 
     /* 设置项(小字, 选中反色) */
     int typ = (int)cfg.tx.type;
@@ -716,35 +717,37 @@ typedef struct {
 static const char *const s_proto_opts[] = { "FT4", "FT8" };
 
 static const ci_item_t s_ci[] = {
-    { "callsign", CI_STR,   cfg.callsign,              0,0,0, sizeof(cfg.callsign), NULL, 0, 0 },
-    { "grid",     CI_STR,   cfg.grid,                  0,0,0, sizeof(cfg.grid),     NULL, 0, 0 },
-    { "band",     CI_STR,   cfg.band,                  0,0,0, sizeof(cfg.band),     NULL, 0, 0 },
-    { "freq_MHz", CI_FLOAT, &cfg.qso_freq_mhz,       0.1f, 60.0f, 0.001f, 0, NULL, 0, 6 },
-    { "protocol", CI_ENUM,  &cfg.protocol,             0,0,0, 0, s_proto_opts, 2, 0 },
-    { "tx_en",    CI_BOOL,  &cfg.tx_enable,            0,0,0, 0, NULL, 0, 0 },
-    { "rx_en",    CI_BOOL,  &cfg.rx_enable,            0,0,0, 0, NULL, 0, 0 },
-    { "usb_msc",  CI_BOOL,  &cfg.usb_mount_enable,     0,0,0, 0, NULL, 0, 0 },
-    { "utc_en",   CI_BOOL,  &cfg.utc_enable,           0,0,0, 0, NULL, 0, 0 },
-    { "gps_utc",  CI_BOOL,  &cfg.gps_utc_enable,       0,0,0, 0, NULL, 0, 0 },
-    { "gps_pps",  CI_BOOL,  &cfg.gps_use_pps,          0,0,0, 0, NULL, 0, 0 },
-    { "slot_par", CI_INT,   &cfg.tx_slot_parity,       0, 1, 1, 0, NULL, 0, 0 },
-    { "delay_ms", CI_U32,   &cfg.tx_delay_ms,          0, 10000, 50, 0, NULL, 0, 0 },
-    { "msg_type", CI_ENUM,  &cfg.tx.type,              0,0,0, 0, s_msg_opts, 7, 0 },
-    { "call_to",  CI_STR,   cfg.tx.call_to,            0,0,0, sizeof(cfg.tx.call_to), NULL, 0, 0 },
-    { "cq_mod",   CI_STR,   cfg.tx.cq_modifier,        0,0,0, sizeof(cfg.tx.cq_modifier), NULL, 0, 0 },
-    { "rst_db",   CI_INT,   &cfg.tx.rst_db,          -30, 30, 1, 0, NULL, 0, 0 },
-    { "af_Hz",    CI_FLOAT, &cfg.audio_freq_hz,        50, 3000, 10, 0, NULL, 0, 0 },
-    { "af_lvl",   CI_FLOAT, &cfg.audio_level,          0, 1, 0.05f, 0, NULL, 0, 2 },
-    { "hp_vol",   CI_U8,    &cfg.codec.hp_vol_l,       0, 63, 1, 0, NULL, 0, 0 },
-    { "rx_fmin",  CI_FLOAT, &cfg.rx_f_min,             0, 3000, 50, 0, NULL, 0, 0 },
-    { "rx_fmax",  CI_FLOAT, &cfg.rx_f_max,           100, 5000, 50, 0, NULL, 0, 0 },
-    { "cand",     CI_INT,   &cfg.max_candidates,       1, 128, 5, 0, NULL, 0, 0 },
-    { "ldpc_it",  CI_INT,   &cfg.ldpc_iterations,      1, 100, 5, 0, NULL, 0, 0 },//
-    { "parse_ms", CI_U32,   &cfg.rx_parse_ms,          0, 5000, 100, 0, NULL, 0, 0 },
-    { "qso_en",   CI_BOOL,  &cfg.qso.enable,           0,0,0, 0, NULL, 0, 0 },
-    { "qso_cq",   CI_BOOL,  &cfg.qso.cq_mode,          0,0,0, 0, NULL, 0, 0 },
-    { "qso_rty",  CI_INT,   &cfg.qso.max_retries,      1, 60, 1, 0, NULL, 0, 0 },
-    { "qso_to",   CI_STR,   cfg.qso.target_callsign,   0,0,0, sizeof(cfg.qso.target_callsign), NULL, 0, 0 },
+    { "callsign",       CI_STR,   cfg.callsign,              0,0,0, sizeof(cfg.callsign), NULL, 0, 0 },
+    { "grid",           CI_STR,   cfg.grid,                  0,0,0, sizeof(cfg.grid),     NULL, 0, 0 },
+    { "band",           CI_STR,   cfg.band,                  0,0,0, sizeof(cfg.band),     NULL, 0, 0 },
+    { "freq_MHz",       CI_FLOAT, &cfg.qso_freq_mhz,       0.1f, 60.0f, 0.001f, 0, NULL, 0, 6 },
+    { "R_protocol",       CI_ENUM,  &cfg.protocol,             0,0,0, 0, s_proto_opts, 2, 0 },
+    { "tx_enable",      CI_BOOL,  &cfg.tx_enable,            0,0,0, 0, NULL, 0, 0 },
+    { "R_rx_enable",      CI_BOOL,  &cfg.rx_enable,            0,0,0, 0, NULL, 0, 0 },
+    { "R_rx_parse_ms",    CI_U32,   &cfg.rx_parse_ms,          0, 5000, 100, 0, NULL, 0, 0 },
+    { "tx_delay_ms",    CI_U32,   &cfg.tx_delay_ms,          0, 10000, 50, 0, NULL, 0, 0 },
+    { "af_lvl",         CI_FLOAT, &cfg.audio_level,          0, 1, 0.05f, 0, NULL, 0, 2 },
+    { "hp_vol",         CI_U8,    &cfg.codec.hp_vol_l,       0, 63, 1, 0, NULL, 0, 0 },
+    { "R_USB_msc",        CI_BOOL,  &cfg.usb_mount_enable,     0,0,0, 0, NULL, 0, 0 },
+    { "utc_en",         CI_BOOL,  &cfg.utc_enable,           0,0,0, 0, NULL, 0, 0 },
+    { "gps_utc",        CI_BOOL,  &cfg.gps_utc_enable,       0,0,0, 0, NULL, 0, 0 },
+    { "gps_pps",        CI_BOOL,  &cfg.gps_use_pps,          0,0,0, 0, NULL, 0, 0 },
+    { "slot_par",       CI_INT,   &cfg.tx_slot_parity,       0, 1, 1, 0, NULL, 0, 0 },
+    { "msg_type",       CI_ENUM,  &cfg.tx.type,              0,0,0, 0, s_msg_opts, 7, 0 },
+    { "call_to",        CI_STR,   cfg.tx.call_to,            0,0,0, sizeof(cfg.tx.call_to), NULL, 0, 0 },
+    { "cq_mod",         CI_STR,   cfg.tx.cq_modifier,        0,0,0, sizeof(cfg.tx.cq_modifier), NULL, 0, 0 },
+    { "rst_db",         CI_INT,   &cfg.tx.rst_db,          -30, 30, 1, 0, NULL, 0, 0 },
+    { "audio_freq_hz",  CI_FLOAT, &cfg.audio_freq_hz,        50, 3000, 10, 0, NULL, 0, 0 },
+    { "R_rx_f_min",       CI_FLOAT, &cfg.rx_f_min,             0, 3000, 50, 0, NULL, 0, 0 },
+    { "R_rx_f_max",       CI_FLOAT, &cfg.rx_f_max,           100, 5000, 50, 0, NULL, 0, 0 },
+    { "max_candidates", CI_INT,   &cfg.max_candidates,       1, 128, 5, 0, NULL, 0, 0 },
+    { "ldpc_iterations",CI_INT,   &cfg.ldpc_iterations,      1, 100, 5, 0, NULL, 0, 0 },//
+    { "R_rx_time_osr",  CI_INT,   &cfg.rx_time_osr,          1, 4, 1, 0, NULL, 0, 0 },
+    { "R_rx_freq_osr",  CI_INT,   &cfg.rx_freq_osr,          1, 4, 1, 0, NULL, 0, 0 },
+    { "R_qso_en",         CI_BOOL,  &cfg.qso.enable,           0,0,0, 0, NULL, 0, 0 },
+    { "qso_cq",         CI_BOOL,  &cfg.qso.cq_mode,          0,0,0, 0, NULL, 0, 0 },
+    { "qso_rty",        CI_INT,   &cfg.qso.max_retries,      1, 60, 1, 0, NULL, 0, 0 },
+    { "qso_to",         CI_STR,   cfg.qso.target_callsign,   0,0,0, sizeof(cfg.qso.target_callsign), NULL, 0, 0 },
 };
 #define CI_N ((int)(sizeof(s_ci) / sizeof(s_ci[0])))
 #define CI_ROWS 12                 /* 小字 12px, 一屏 12 行 */

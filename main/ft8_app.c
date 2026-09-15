@@ -86,6 +86,7 @@ static tx_wave_key_t s_last_err_key;     /* 最近一次编码失败的快照(�
 /* 运行统计 */
 static uint32_t s_stat_slots = 0;
 static uint32_t s_stat_decoded = 0;
+static volatile uint32_t s_dec_ms = 0;   /* 最近一次解码耗时(ms) */
 
 /* ---------- 协议参数换算 ---------- */
 static bool app_is_ft4(void)             { return s_cfg.protocol == FTX_PROTOCOL_FT4; }
@@ -568,6 +569,11 @@ bool ft8_app_in_tx_slot(void)
     return ((int)(slot & 1)) == (s_cfg.tx_slot_parity & 1);
 }
 
+uint32_t ft8_app_dec_ms(void)
+{
+    return s_dec_ms;
+}
+
 /* ============================================================
  * RX：整窗解析一个时隙(带解码耗时预算，避免拖入下一时隙采集)
  * ============================================================ */
@@ -674,6 +680,8 @@ static void rx_decode_snapshot(const ftx_waterfall_t *wf, int64_t prev_slot, int
     if (budget_cut)
         ESP_LOGW(T, "[RX] 解析预算 %lldms 用尽提前结束，剩余 %d 个候选未处理",
                  (long long)(budget_us / 1000), remaining);
+
+    s_dec_ms = (uint32_t)((esp_timer_get_time() - t0) / 1000);
 }
 
 /* 丢弃一小段 RX 音频(在接收间隙也持续读取，防止 I2S DMA 积压，
@@ -1667,11 +1675,12 @@ esp_err_t ft8_app_start(const ft8_app_config_t *cfg)
         }
     }
 
-    /* 独立解码任务(另一核): 时隙末异步解析快照, 不占用下一时隙采集 */
+    /* 独立解码任务(core1): 时隙末异步解析快照, 与收发核隔离, 不占用采集/发射 */
     if (s_cfg.rx_enable)
-        xTaskCreatePinnedToCore(ft8_dec_task, "ft8_dec", 24576, NULL, 5, &s_dec_task, 0);
+        xTaskCreatePinnedToCore(ft8_dec_task, "ft8_dec", 24576, NULL, 5, &s_dec_task, 1);
 
-    xTaskCreatePinnedToCore(ft8_rx_task, "ft8_rx", STACK_RX, NULL, 6, &s_task_rx, 1);
-    xTaskCreatePinnedToCore(ft8_tx_task, "ft8_tx", STACK_TX, NULL, 6, &s_task_tx, 0);
+    /* 收发同一核(core0): TX 优先级最高(7)保证忙等起播精度, RX 次之(6) */
+    xTaskCreatePinnedToCore(ft8_rx_task, "ft8_rx", STACK_RX, NULL, 6, &s_task_rx, 0);
+    xTaskCreatePinnedToCore(ft8_tx_task, "ft8_tx", STACK_TX, NULL, 7, &s_task_tx, 0);
     return ESP_OK;
 }

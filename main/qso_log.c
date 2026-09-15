@@ -462,8 +462,24 @@ esp_err_t cfg_store_load(ft8_app_config_t *cfg)
             cfg->tx_delay_ms = (uint32_t)strtoul(v, NULL, 10);
         } else if (!strcmp(k, "audio_level")) {
             cfg->audio_level = (float)atof(v);
+        } else if (!strcmp(k, "hp_vol")) {
+            int x = atoi(v);
+            if (x < 0) x = 0;
+            if (x > 63) x = 63;
+            cfg->codec.hp_vol_l = (uint8_t)x;
+            cfg->codec.hp_vol_r = (uint8_t)x;
         } else if (!strcmp(k, "rx_parse_ms")) {
             cfg->rx_parse_ms = (uint32_t)strtoul(v, NULL, 10);
+        } else if (!strcmp(k, "rx_time_osr")) {
+            int x = atoi(v);
+            if (x < 1) x = 1;
+            if (x > 8) x = 8;
+            cfg->rx_time_osr = x;
+        } else if (!strcmp(k, "rx_freq_osr")) {
+            int x = atoi(v);
+            if (x < 1) x = 1;
+            if (x > 8) x = 8;
+            cfg->rx_freq_osr = x;
         }
     }
     fclose(f);
@@ -496,7 +512,10 @@ esp_err_t cfg_store_save(const ft8_app_config_t *cfg)
     fprintf(f, "tx_slot_parity=%d\n",  cfg->tx_slot_parity);
     fprintf(f, "tx_delay_ms=%lu\n",    (unsigned long)cfg->tx_delay_ms);
     fprintf(f, "audio_level=%.2f\n",   (double)cfg->audio_level);
+    fprintf(f, "hp_vol=%u\n",          (unsigned)cfg->codec.hp_vol_l);
     fprintf(f, "rx_parse_ms=%lu\n",    (unsigned long)cfg->rx_parse_ms);
+    fprintf(f, "rx_time_osr=%d\n",     cfg->rx_time_osr);
+    fprintf(f, "rx_freq_osr=%d\n",     cfg->rx_freq_osr);
     fclose(f);
     return ESP_OK;
 }
